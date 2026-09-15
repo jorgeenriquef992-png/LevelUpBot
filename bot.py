@@ -219,4 +219,531 @@ async def set_rewards(guild_id, class_name, level, rewards):
             ON CONFLICT(guild_id, class_name, level) DO UPDATE SET rewards=excluded.rewards""",
             (guild_id, class_name, level, json.dumps(rewards)))
         await db.commit()
-        
+
+async def get_rewards(guild_id, class_name, level):
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute("SELECT rewards FROM class_rewards WHERE guild_id=? AND class_name=? AND level=?", (guild_id, class_name, level)) as cur:
+            row = await cur.fetchone()
+            return json.loads(row[0]) if row else []
+
+async def get_all_rewards(guild_id, class_name):
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute("SELECT level, rewards FROM class_rewards WHERE guild_id=? AND class_name=? ORDER BY level", (guild_id, class_name)) as cur:
+            return {r[0]: json.loads(r[1]) for r in await cur.fetchall()}
+
+async def delete_rewards(guild_id, class_name, level):
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute("DELETE FROM class_rewards WHERE guild_id=? AND class_name=? AND level=?", (guild_id, class_name, level))
+        await db.commit()
+
+async def get_user_class(guild_id, user_id):
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute("SELECT class_name FROM user_class WHERE guild_id=? AND user_id=?", (guild_id, user_id)) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else None
+
+async def set_user_class(guild_id, user_id, class_name):
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute("""INSERT INTO user_class (guild_id, user_id, class_name) VALUES (?,?,?)
+            ON CONFLICT(guild_id, user_id) DO UPDATE SET class_name=excluded.class_name""", (guild_id, user_id, class_name))
+        await db.commit()
+
+async def remove_user_class(guild_id, user_id):
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute("DELETE FROM user_class WHERE guild_id=? AND user_id=?", (guild_id, user_id))
+        await db.commit()
+
+async def add_auto_message(guild_id, trigger, responses, channel_ids):
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute("INSERT INTO auto_messages (guild_id, trigger_word, responses, channel_ids) VALUES (?,?,?,?)",
+            (guild_id, trigger.lower(), json.dumps(responses), json.dumps(channel_ids)))
+        await db.commit()
+
+async def get_auto_messages(guild_id):
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute("SELECT id, trigger_word, responses, channel_ids FROM auto_messages WHERE guild_id=?", (guild_id,)) as cur:
+            return [{"id": r[0], "trigger": r[1], "responses": json.loads(r[2]), "channels": json.loads(r[3])} for r in await cur.fetchall()]
+
+async def delete_auto_message(guild_id, msg_id):
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute("DELETE FROM auto_messages WHERE guild_id=? AND id=?", (guild_id, msg_id))
+        await db.commit()
+
+async def add_scheduled_message(guild_id, channel_id, content, send_at, embed_data=None):
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute("INSERT INTO scheduled_messages (guild_id, channel_id, content, embed_data, send_at) VALUES (?,?,?,?,?)",
+            (guild_id, channel_id, content, embed_data, send_at))
+        await db.commit()
+
+async def get_pending_scheduled():
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute("SELECT id, guild_id, channel_id, content, embed_data, send_at FROM scheduled_messages WHERE sent=0") as cur:
+            return await cur.fetchall()
+
+async def mark_scheduled_sent(msg_id):
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute("UPDATE scheduled_messages SET sent=1 WHERE id=?", (msg_id,))
+        await db.commit()
+
+async def has_admin_permission(interaction):
+    if interaction.user.guild_permissions.administrator:
+        return True
+    config = await get_guild_config(interaction.guild_id)
+    return any(role.id in config["admin_roles"] for role in interaction.user.roles)
+
+def admin_only():
+    async def predicate(interaction):
+        if not await has_admin_permission(interaction):
+            await interaction.response.send_message("❌ No tienes permiso.", ephemeral=True)
+            return False
+        return True
+    return app_commands.check(predicate)
+
+@bot.event
+async def on_ready():
+    await init_db()
+    if not check_scheduled.is_running():
+        check_scheduled.start()
+    try:
+        synced = await tree.sync()
+        print(f"✅ Bot conectado como {bot.user}")
+        print(f"✅ Sincronizados {len(synced)} comandos")
+    except Exception as e:
+        print(f"Error: {e}")
+
+@tasks.loop(seconds=30)
+async def check_scheduled():
+    now = datetime.now(timezone.utc)
+    for msg_id, guild_id, channel_id, content, embed_data, send_at in await get_pending_scheduled():
+        try:
+            send_time = datetime.fromisoformat(send_at)
+            if send_time.tzinfo is None:
+                send_time = send_time.replace(tzinfo=timezone.utc)
+            if now >= send_time:
+                guild = bot.get_guild(guild_id)
+                if guild:
+                    channel = guild.get_channel(channel_id)
+                    if channel:
+                        await channel.send(content)
+                await mark_scheduled_sent(msg_id)
+        except Exception as e:
+            print(f"Error programado {msg_id}: {e}")
+
+@bot.event
+async def on_message(message):
+    if not message.guild or not message.content:
+        return
+
+    content = message.content.strip()
+    content_lower = content.lower()
+
+    # CALCULADORA
+    math_pattern = r'^[\d\s\+\-\*\/\×\÷\^\(\)\.\%]+$'
+    clean = content.replace(" ", "")
+    if re.match(math_pattern, clean) and any(op in content for op in "+-*/×÷^%"):
+        result = safe_eval(content)
+        if result is not None:
+            if isinstance(result, float) and result.is_integer():
+                result = int(result)
+            await message.reply(f"**{content} = {result}**", mention_author=False)
+            return
+
+    # DADOS
+    dice_match = re.search(r'(\d{1,3})d(\d{1,5})', content_lower)
+    if dice_match:
+        num_dice = int(dice_match.group(1))
+        sides = int(dice_match.group(2))
+        if 1 <= num_dice <= 100 and 2 <= sides <= 100000:
+            results = [random.randint(1, sides) for _ in range(num_dice)]
+            total = sum(results)
+            if num_dice == 1:
+                await message.reply(f"🎲 **{num_dice}d{sides}** = **{results[0]}**", mention_author=False)
+            else:
+                details = ", ".join(map(str, results))
+                await message.reply(f"🎲 **{num_dice}d{sides}** = [{details}] → **Total: {total}**", mention_author=False)
+            return
+
+    # ELIGE
+    if content_lower.startswith("elige:"):
+        options = [opt.strip() for opt in content[6:].split(",") if opt.strip()]
+        if len(options) >= 2:
+            chosen = random.choice(options)
+            await message.reply(f"🎯 **He elegido:** {chosen}", mention_author=False)
+            return
+
+    # MENSAJES AUTOMÁTICOS
+    for auto in await get_auto_messages(message.guild.id):
+        if auto["trigger"] in content_lower:
+            if auto["channels"] and message.channel.id not in auto["channels"]:
+                continue
+            await message.channel.send(random.choice(auto["responses"]))
+            break
+
+    # XP
+    if message.author.bot:
+        return
+
+    user_class = await get_user_class(message.guild.id, message.author.id)
+    if not user_class:
+        return
+
+    key = f"{message.guild.id}:{message.author.id}"
+    now = datetime.now(timezone.utc).timestamp()
+    if key in cooldowns and now - cooldowns[key] < XP_COOLDOWN:
+        return
+    if await is_channel_ignored(message.guild.id, message.channel.id):
+        return
+
+    config = await get_guild_config(message.guild.id)
+    data = await get_user_data(message.guild.id, message.author.id)
+    if config.get("max_level", 0) > 0 and data["level"] >= config["max_level"]:
+        return
+
+    xp_gain = random.randint(XP_MIN, XP_MAX)
+    new_xp, new_level, leveled_up = await add_xp(message.guild.id, message.author.id, xp_gain)
+    cooldowns[key] = now
+    if leveled_up:
+        await send_levelup_message(message.guild, message.author, new_level, user_class)
+
+async def send_levelup_message(guild, member, level, class_name):
+    config = await get_guild_config(guild.id)
+    channel_id = config["levelup_channel_id"]
+    if not channel_id:
+        return
+    channel = guild.get_channel(channel_id)
+    if not channel:
+        return
+    rewards = await get_rewards(guild.id, class_name, level)
+    embed = discord.Embed(
+        title="🎉 ¡Subiste de Nivel!",
+        description=f"¡Felicidades {member.mention}!\n\nHas alcanzado el **Nivel {level}** 🚀\n**Clase:** {class_name}",
+        color=discord.Color.gold(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    if rewards:
+        embed.add_field(name=f"🎁 Has desbloqueado en el nivel {level}:", value="\n".join(f"• {r}" for r in rewards), inline=False)
+    embed.set_footer(text="Level Up • Creado por 《JEFP25》")
+    try:
+        await channel.send(content=member.mention, embed=embed)
+    except:
+        pass
+
+@tree.command(name="rank", description="Muestra tu nivel y XP")
+async def rank(interaction: discord.Interaction, usuario: discord.Member = None):
+    target = usuario or interaction.user
+    data = await get_user_data(interaction.guild_id, target.id)
+    user_class = await get_user_class(interaction.guild_id, target.id)
+    current_level, current_xp = data["level"], data["xp"]
+    next_level_xp = xp_for_level(current_level + 1)
+    xp_needed = max(0, next_level_xp - current_xp)
+    prev_xp = xp_for_level(current_level)
+    progress = max(0, min(1, (current_xp - prev_xp) / (next_level_xp - prev_xp) if next_level_xp > prev_xp else 0))
+    bar = "█" * int(12 * progress) + "░" * (12 - int(12 * progress))
+    embed = discord.Embed(title=f"📊 Rank de {target.display_name}", color=discord.Color.blurple())
+    embed.set_thumbnail(url=target.display_avatar.url)
+    embed.add_field(name="Nivel", value=f"**{current_level}**", inline=True)
+    embed.add_field(name="XP Total", value=f"**{current_xp:,}**", inline=True)
+    embed.add_field(name="Siguiente nivel", value=f"**{xp_needed:,}** XP", inline=True)
+    embed.add_field(name="Clase", value=user_class or "❌ Sin clase", inline=True)
+    embed.add_field(name="Progreso", value=f"`{bar}` {int(progress*100)}%", inline=False)
+    embed.set_footer(text="Creado por 《JEFP25》")
+    await interaction.response.send_message(embed=embed)
+
+@tree.command(name="leaderboard", description="Top 10 del servidor")
+async def leaderboard(interaction: discord.Interaction):
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute("SELECT user_id, xp, level FROM users WHERE guild_id=? ORDER BY xp DESC LIMIT 10", (interaction.guild_id,)) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        await interaction.response.send_message("Aún no hay datos.", ephemeral=True)
+        return
+    description = ""
+    medals = ["🥇", "🥈", "🥉"]
+    for i, (user_id, xp, level) in enumerate(rows):
+        medal = medals[i] if i < 3 else f"**{i+1}.**"
+        member = interaction.guild.get_member(user_id)
+        name = member.display_name if member else f"Usuario {user_id}"
+        user_class = await get_user_class(interaction.guild_id, user_id)
+        description += f"{medal} {name}{f' ({user_class})' if user_class else ''} — Nivel **{level}** ({xp:,} XP)\n"
+    embed = discord.Embed(title="🏆 Leaderboard", description=description, color=discord.Color.gold())
+    embed.set_footer(text="Creado por 《JEFP25》")
+    await interaction.response.send_message(embed=embed)
+
+@tree.command(name="elegir-clase", description="Elige tu clase (solo una vez)")
+async def elegir_clase(interaction: discord.Interaction, clase: str):
+    if await get_user_class(interaction.guild_id, interaction.user.id):
+        await interaction.response.send_message("❌ Ya tienes clase.", ephemeral=True)
+        return
+    if not await class_exists(interaction.guild_id, clase):
+        clases = await get_classes(interaction.guild_id)
+        await interaction.response.send_message(f"❌ No existe. Disponibles: {', '.join(clases) or 'Ninguna'}", ephemeral=True)
+        return
+    await set_user_class(interaction.guild_id, interaction.user.id, clase)
+    await interaction.response.send_message(f"✅ Has elegido la clase **{clase}**.")
+
+@tree.command(name="mi-clase", description="Muestra tu clase actual")
+async def mi_clase(interaction: discord.Interaction):
+    user_class = await get_user_class(interaction.guild_id, interaction.user.id)
+    await interaction.response.send_message(f"🛡️ Tu clase es: **{user_class}**" if user_class else "❌ No tienes clase. Usa `/elegir-clase`.")
+
+@tree.command(name="ver-lista", description="Ver recompensas de una clase")
+async def ver_lista(interaction: discord.Interaction, clase: str = None):
+    if not clase:
+        clase = await get_user_class(interaction.guild_id, interaction.user.id)
+        if not clase:
+            await interaction.response.send_message("❌ Indica una clase.", ephemeral=True)
+            return
+    if not await class_exists(interaction.guild_id, clase):
+        await interaction.response.send_message("❌ Esa clase no existe.", ephemeral=True)
+        return
+    rewards = await get_all_rewards(interaction.guild_id, clase)
+    if not rewards:
+        await interaction.response.send_message(f"La clase **{clase}** no tiene recompensas.")
+        return
+    description = "".join(f"**Nivel {lv}:**\n" + "\n".join(f"  • {r}" for r in rw) + "\n\n" for lv, rw in sorted(rewards.items()))
+    embed = discord.Embed(title=f"📜 Recompensas de {clase}", description=description, color=discord.Color.purple())
+    embed.set_footer(text="Creado por 《JEFP25》")
+    await interaction.response.send_message(embed=embed)
+
+@tree.command(name="help", description="Lista de comandos")
+async def help_command(interaction: discord.Interaction):
+    embed = discord.Embed(title="📖 Level Up - Comandos", color=discord.Color.blue())
+    embed.add_field(name="👤 Usuario", value="`/rank` `/leaderboard` `/elegir-clase` `/mi-clase` `/ver-lista` `/help`", inline=False)
+    embed.add_field(name="🎲 Utilidades (escribe en el chat)", value="`1d20` `3d6` `Elige: sí, no, tal vez`\n`1+2` `10*5` `25%`", inline=False)
+    embed.add_field(name="🛡️ Admin", value="`/dar-xp` `/quitar-xp` `/ver-xp` `/dar-xp-rol` `/quitar-xp-rol` `/resetear-xp` `/resetear-xp-rol`\n`/añadir-clase` `/borrar-clase` `/añadir-recompensa` `/borrar-recompensa` `/resetear-clase` `/set-nivel-maximo`\n`/embed` `/programar-mensaje` `/auto-mensaje` `/auto-lista` `/auto-borrar`", inline=False)
+    embed.add_field(name="⚙️ Config", value="`/config-canal-levelup` `/config-desactivar-levelup` `/config-ignorar-canal` `/config-permitir-canal` `/config-canales-ignorados` `/config-roles-admin` `/config-ver`", inline=False)
+    embed.set_footer(text="Creado por 《JEFP25》")
+    await interaction.response.send_message(embed=embed)
+
+@tree.command(name="dar-xp", description="Da XP a un usuario")
+@admin_only()
+async def dar_xp(interaction: discord.Interaction, usuario: discord.Member, cantidad: app_commands.Range[int, 1, 1000000]):
+    new_xp, new_level, leveled_up = await add_xp(interaction.guild_id, usuario.id, cantidad)
+    user_class = await get_user_class(interaction.guild_id, usuario.id)
+    msg = f"✅ **{cantidad:,} XP** a {usuario.mention}. Ahora: **{new_xp:,} XP** (Nivel {new_level})"
+    if leveled_up and user_class:
+        await send_levelup_message(interaction.guild, usuario, new_level, user_class)
+    await interaction.response.send_message(msg)
+
+@tree.command(name="quitar-xp", description="Quita XP a un usuario")
+@admin_only()
+async def quitar_xp(interaction: discord.Interaction, usuario: discord.Member, cantidad: app_commands.Range[int, 1, 1000000]):
+    new_xp, new_level, _ = await add_xp(interaction.guild_id, usuario.id, -cantidad)
+    await interaction.response.send_message(f"✅ Quitados **{cantidad:,} XP** a {usuario.mention}. Ahora: **{new_xp:,} XP** (Nivel {new_level})")
+
+@tree.command(name="ver-xp", description="Ver XP de un usuario")
+@admin_only()
+async def ver_xp(interaction: discord.Interaction, usuario: discord.Member):
+    data = await get_user_data(interaction.guild_id, usuario.id)
+    user_class = await get_user_class(interaction.guild_id, usuario.id)
+    await interaction.response.send_message(f"📊 {usuario.mention}: **{data['xp']:,} XP** | Nivel **{data['level']}** | Clase: **{user_class or 'Sin clase'}**")
+
+@tree.command(name="dar-xp-rol", description="Da XP a un rol")
+@admin_only()
+async def dar_xp_rol(interaction: discord.Interaction, rol: discord.Role, cantidad: app_commands.Range[int, 1, 100000]):
+    await interaction.response.defer()
+    members = [m for m in rol.members if not m.bot]
+    for m in members:
+        await add_xp(interaction.guild_id, m.id, cantidad)
+    await interaction.followup.send(f"✅ **{cantidad:,} XP** a **{len(members)}** miembros de {rol.mention}.")
+
+@tree.command(name="quitar-xp-rol", description="Quita XP a un rol")
+@admin_only()
+async def quitar_xp_rol(interaction: discord.Interaction, rol: discord.Role, cantidad: app_commands.Range[int, 1, 100000]):
+    await interaction.response.defer()
+    members = [m for m in rol.members if not m.bot]
+    for m in members:
+        await add_xp(interaction.guild_id, m.id, -cantidad)
+    await interaction.followup.send(f"✅ Quitados **{cantidad:,} XP** a **{len(members)}** miembros de {rol.mention}.")
+
+@tree.command(name="resetear-xp", description="Resetea XP de un usuario")
+@admin_only()
+async def resetear_xp(interaction: discord.Interaction, usuario: discord.Member):
+    await set_user_xp(interaction.guild_id, usuario.id, 0)
+    await interaction.response.send_message(f"✅ XP de {usuario.mention} reseteado.")
+
+@tree.command(name="resetear-xp-rol", description="Resetea XP de un rol")
+@admin_only()
+async def resetear_xp_rol(interaction: discord.Interaction, rol: discord.Role):
+    await interaction.response.defer()
+    members = [m for m in rol.members if not m.bot]
+    for m in members:
+        await set_user_xp(interaction.guild_id, m.id, 0)
+    await interaction.followup.send(f"✅ XP reseteado a **{len(members)}** miembros de {rol.mention}.")
+
+@tree.command(name="añadir-clase", description="Crea una clase")
+@admin_only()
+async def añadir_clase(interaction: discord.Interaction, nombre: str):
+    if await add_class(interaction.guild_id, nombre.strip()):
+        await interaction.response.send_message(f"✅ Clase **{nombre}** creada.")
+    else:
+        await interaction.response.send_message("❌ Ya existe.", ephemeral=True)
+
+@tree.command(name="borrar-clase", description="Borra una clase")
+@admin_only()
+async def borrar_clase(interaction: discord.Interaction, nombre: str):
+    if not await class_exists(interaction.guild_id, nombre):
+        await interaction.response.send_message("❌ No existe.", ephemeral=True)
+        return
+    await remove_class(interaction.guild_id, nombre)
+    await interaction.response.send_message(f"✅ Clase **{nombre}** eliminada.")
+
+@tree.command(name="añadir-recompensa", description="Añade recompensas a un nivel")
+@admin_only()
+async def añadir_recompensa(interaction: discord.Interaction, clase: str, nivel: app_commands.Range[int, 1, 500], recompensas: str):
+    if not await class_exists(interaction.guild_id, clase):
+        await interaction.response.send_message("❌ Clase no existe.", ephemeral=True)
+        return
+    items = [r.strip() for r in recompensas.split("|") if r.strip()]
+    await set_rewards(interaction.guild_id, clase, nivel, items)
+    await interaction.response.send_message(f"✅ Recompensas en **{clase}** nivel **{nivel}**:\n" + "\n".join(f"• {i}" for i in items))
+
+@tree.command(name="borrar-recompensa", description="Borra recompensas de un nivel")
+@admin_only()
+async def borrar_recompensa(interaction: discord.Interaction, clase: str, nivel: app_commands.Range[int, 1, 500]):
+    await delete_rewards(interaction.guild_id, clase, nivel)
+    await interaction.response.send_message(f"✅ Recompensas del nivel **{nivel}** eliminadas.")
+
+@tree.command(name="resetear-clase", description="Quita la clase a un usuario")
+@admin_only()
+async def resetear_clase(interaction: discord.Interaction, usuario: discord.Member):
+    current = await get_user_class(interaction.guild_id, usuario.id)
+    if not current:
+        await interaction.response.send_message("No tiene clase.", ephemeral=True)
+        return
+    await remove_user_class(interaction.guild_id, usuario.id)
+    await interaction.response.send_message(f"✅ Se quitó la clase **{current}** a {usuario.mention}.")
+
+@tree.command(name="set-nivel-maximo", description="Nivel máximo (0 = sin límite)")
+@admin_only()
+async def set_nivel_maximo(interaction: discord.Interaction, nivel: app_commands.Range[int, 0, 500]):
+    await set_max_level(interaction.guild_id, nivel)
+    await interaction.response.send_message("✅ Límite eliminado." if nivel == 0 else f"✅ Nivel máximo: **{nivel}**")
+
+@tree.command(name="embed", description="Crea y envía un embed")
+@admin_only()
+@app_commands.describe(canal="Canal destino", titulo="Título", descripcion="Descripción", color="Color hex (ej: FF0000)", footer="Pie de página")
+async def crear_embed(interaction: discord.Interaction, canal: discord.TextChannel, titulo: str = None, descripcion: str = None, color: str = "5865F2", footer: str = None):
+    try:
+        color_value = int(color.replace("#", ""), 16)
+    except:
+        color_value = 0x5865F2
+    embed = discord.Embed(color=color_value)
+    if titulo: embed.title = titulo
+    if descripcion: embed.description = descripcion
+    if footer: embed.set_footer(text=footer)
+    try:
+        await canal.send(embed=embed)
+        await interaction.response.send_message(f"✅ Embed enviado en {canal.mention}", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
+
+@tree.command(name="auto-mensaje", description="Mensaje automático por palabra clave")
+@admin_only()
+@app_commands.describe(palabra="Palabra que activa", respuestas="Respuestas separadas por |", canales="IDs de canales separados por coma (vacío = todos)")
+async def auto_mensaje(interaction: discord.Interaction, palabra: str, respuestas: str, canales: str = None):
+    resp_list = [r.strip() for r in respuestas.split("|") if r.strip()]
+    if not resp_list:
+        await interaction.response.send_message("❌ Pon al menos una respuesta.", ephemeral=True)
+        return
+    channel_ids = []
+    if canales:
+        for c in canales.split(","):
+            if c.strip().isdigit():
+                channel_ids.append(int(c.strip()))
+    await add_auto_message(interaction.guild_id, palabra, resp_list, channel_ids)
+    await interaction.response.send_message(f"✅ Auto-mensaje creado.\nPalabra: `{palabra}`\nRespuestas: {len(resp_list)}")
+
+@tree.command(name="auto-lista", description="Lista mensajes automáticos")
+@admin_only()
+async def auto_lista(interaction: discord.Interaction):
+    autos = await get_auto_messages(interaction.guild_id)
+    if not autos:
+        await interaction.response.send_message("No hay mensajes automáticos.")
+        return
+    text = "\n".join(f"**ID {a['id']}** — `{a['trigger']}` ({len(a['responses'])} respuestas)" for a in autos)
+    embed = discord.Embed(title="📋 Mensajes Automáticos", description=text, color=discord.Color.blue())
+    await interaction.response.send_message(embed=embed)
+
+@tree.command(name="auto-borrar", description="Borra un auto-mensaje por ID")
+@admin_only()
+async def auto_borrar(interaction: discord.Interaction, id: int):
+    await delete_auto_message(interaction.guild_id, id)
+    await interaction.response.send_message(f"✅ Auto-mensaje **{id}** eliminado.")
+
+@tree.command(name="programar-mensaje", description="Programa un mensaje")
+@admin_only()
+@app_commands.describe(canal="Canal", mensaje="Texto del mensaje", fecha="Fecha UTC: YYYY-MM-DD HH:MM")
+async def programar_mensaje(interaction: discord.Interaction, canal: discord.TextChannel, mensaje: str, fecha: str):
+    try:
+        send_at = datetime.strptime(fecha, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+    except ValueError:
+        await interaction.response.send_message("❌ Formato: `YYYY-MM-DD HH:MM` (ej: 2026-09-20 18:30)", ephemeral=True)
+        return
+    if send_at < datetime.now(timezone.utc):
+        await interaction.response.send_message("❌ La fecha debe ser futura.", ephemeral=True)
+        return
+    await add_scheduled_message(interaction.guild_id, canal.id, mensaje, send_at.isoformat())
+    await interaction.response.send_message(f"✅ Mensaje programado para **{fecha} UTC** en {canal.mention}")
+
+@tree.command(name="config-canal-levelup", description="Canal de level up")
+@admin_only()
+async def config_canal_levelup(interaction: discord.Interaction, canal: discord.TextChannel):
+    await set_levelup_channel(interaction.guild_id, canal.id)
+    await interaction.response.send_message(f"✅ Canal de level up: {canal.mention}")
+
+@tree.command(name="config-desactivar-levelup", description="Desactiva level up messages")
+@admin_only()
+async def config_desactivar_levelup(interaction: discord.Interaction):
+    await set_levelup_channel(interaction.guild_id, None)
+    await interaction.response.send_message("✅ Mensajes de level up desactivados.")
+
+@tree.command(name="config-ignorar-canal", description="No ganar XP en un canal")
+@admin_only()
+async def config_ignorar_canal(interaction: discord.Interaction, canal: discord.TextChannel):
+    await add_ignored_channel(interaction.guild_id, canal.id)
+    await interaction.response.send_message(f"✅ Ya no se gana XP en {canal.mention}")
+
+@tree.command(name="config-permitir-canal", description="Permitir XP en un canal")
+@admin_only()
+async def config_permitir_canal(interaction: discord.Interaction, canal: discord.TextChannel):
+    await remove_ignored_channel(interaction.guild_id, canal.id)
+    await interaction.response.send_message(f"✅ Ahora se gana XP en {canal.mention}")
+
+@tree.command(name="config-canales-ignorados", description="Lista canales bloqueados")
+@admin_only()
+async def config_canales_ignorados(interaction: discord.Interaction):
+    channels = await get_ignored_channels(interaction.guild_id)
+    if not channels:
+        await interaction.response.send_message("No hay canales ignorados.")
+        return
+    mentions = [interaction.guild.get_channel(c).mention if interaction.guild.get_channel(c) else str(c) for c in channels]
+    await interaction.response.send_message("**Canales ignorados:**\n" + "\n".join(mentions))
+
+@tree.command(name="config-roles-admin", description="Roles de administración")
+@admin_only()
+async def config_roles_admin(interaction: discord.Interaction, rol1: discord.Role, rol2: discord.Role = None, rol3: discord.Role = None):
+    roles = [rol1]
+    for r in [rol2, rol3]:
+        if r and r not in roles:
+            roles.append(r)
+    await set_admin_roles(interaction.guild_id, [r.id for r in roles])
+    await interaction.response.send_message("✅ Roles actualizados: " + " ".join(r.mention for r in roles))
+
+@tree.command(name="config-ver", description="Ver configuración")
+@admin_only()
+async def config_ver(interaction: discord.Interaction):
+    config = await get_guild_config(interaction.guild_id)
+    classes = await get_classes(interaction.guild_id)
+    embed = discord.Embed(title="⚙️ Configuración", color=discord.Color.blue())
+    embed.add_field(name="Nivel máximo", value=str(config["max_level"]) if config["max_level"] else "Sin límite", inline=True)
+    embed.add_field(name="Clases", value=", ".join(classes) if classes else "Ninguna", inline=False)
+    embed.set_footer(text="Creado por 《JEFP25》")
+    await interaction.response.send_message(embed=embed)
+
+if __name__ == "__main__":
+    if not TOKEN:
+        print("❌ Falta DISCORD_TOKEN")
+    else:
+        bot.run(TOKEN)
