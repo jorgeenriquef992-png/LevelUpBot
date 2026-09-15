@@ -216,4 +216,7 @@ async def class_exists(guild_id, class_name):
 async def set_rewards(guild_id, class_name, level, rewards):
     async with aiosqlite.connect(DATABASE) as db:
         await db.execute("""INSERT INTO class_rewards (guild_id, class_name, level, rewards) VALUES (?,?,?,?)
-            ON CONFLICT
+            ON CONFLICT(guild_id, class_name, level) DO UPDATE SET rewards=excluded.rewards""",
+            (guild_id, class_name, level, json.dumps(rewards)))
+        await db.commit()
+        
