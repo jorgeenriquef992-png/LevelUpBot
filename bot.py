@@ -39,9 +39,9 @@ SAFE_OPERATORS = {
 
 def safe_eval(expr: str):
     expr = expr.replace("×", "*").replace("÷", "/").replace("^", "**")
-    expr = re.sub(r'(\d+(?:\.\d+)?)%', r'(\1/100)', expr)
+    expr = re.sub(r"(\d+(?:\.\d+)?)%", r"(\1/100)", expr)
     try:
-        node = ast.parse(expr, mode='eval').body
+        node = ast.parse(expr, mode="eval").body
         return _eval_node(node)
     except Exception:
         return None
@@ -49,23 +49,19 @@ def safe_eval(expr: str):
 def _eval_node(node):
     if isinstance(node, ast.Constant):
         return node.value
-    elif isinstance(node, ast.Num):
+    if isinstance(node, ast.Num):
         return node.n
-    elif isinstance(node, ast.BinOp):
-        left = _eval_node(node.left)
-        right = _eval_node(node.right)
+    if isinstance(node, ast.BinOp):
         op = SAFE_OPERATORS.get(type(node.op))
         if op is None:
             raise ValueError("Operador no permitido")
-        return op(left, right)
-    elif isinstance(node, ast.UnaryOp):
-        operand = _eval_node(node.operand)
+        return op(_eval_node(node.left), _eval_node(node.right))
+    if isinstance(node, ast.UnaryOp):
         op = SAFE_OPERATORS.get(type(node.op))
         if op is None:
             raise ValueError("Operador no permitido")
-        return op(operand)
-    else:
-        raise ValueError("Expresión no permitida")
+        return op(_eval_node(node.operand))
+    raise ValueError("Expresión no permitida")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -106,11 +102,29 @@ async def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL,
             channel_id INTEGER NOT NULL, content TEXT NOT NULL,
             embed_data TEXT, send_at TEXT NOT NULL, sent INTEGER DEFAULT 0)""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS economy (
+            guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+            money INTEGER DEFAULT 0, PRIMARY KEY (guild_id, user_id))""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS shops (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL, name TEXT NOT NULL)""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS shop_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            shop_id INTEGER NOT NULL, item_name TEXT NOT NULL,
+            price INTEGER NOT NULL, description TEXT DEFAULT '')""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS inventory (
+            guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+            item_name TEXT NOT NULL, quantity INTEGER DEFAULT 0,
+            PRIMARY KEY (guild_id, user_id, item_name))""")
         await db.commit()
 
+# ---------- XP ----------
 async def get_user_data(guild_id, user_id):
     async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute("SELECT xp, level FROM users WHERE guild_id=? AND user_id=?", (guild_id, user_id)) as cur:
+        async with db.execute(
+            "SELECT xp, level FROM users WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id)
+        ) as cur:
             row = await cur.fetchone()
             return {"xp": row[0], "level": row[1]} if row else {"xp": 0, "level": 0}
 
@@ -122,9 +136,11 @@ async def set_user_xp(guild_id, user_id, xp):
         level = max_level
         xp = xp_for_level(max_level)
     async with aiosqlite.connect(DATABASE) as db:
-        await db.execute("""INSERT INTO users (guild_id, user_id, xp, level) VALUES (?,?,?,?)
+        await db.execute(
+            """INSERT INTO users (guild_id, user_id, xp, level) VALUES (?,?,?,?)
             ON CONFLICT(guild_id, user_id) DO UPDATE SET xp=excluded.xp, level=excluded.level""",
-            (guild_id, user_id, xp, level))
+            (guild_id, user_id, xp, level)
+        )
         await db.commit()
     return level
 
@@ -143,57 +159,129 @@ async def add_xp(guild_id, user_id, amount):
 
 async def get_guild_config(guild_id):
     async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute("SELECT levelup_channel_id, admin_roles, max_level FROM guild_config WHERE guild_id=?", (guild_id,)) as cur:
+        async with db.execute(
+            "SELECT levelup_channel_id, admin_roles, max_level FROM guild_config WHERE guild_id=?",
+            (guild_id,)
+        ) as cur:
             row = await cur.fetchone()
             if row:
-                return {"levelup_channel_id": row[0], "admin_roles": json.loads(row[1]) if row[1] else [], "max_level": row[2] or 0}
+                return {
+                    "levelup_channel_id": row[0],
+                    "admin_roles": json.loads(row[1]) if row[1] else [],
+                    "max_level": row[2] or 0
+                }
             return {"levelup_channel_id": None, "admin_roles": [], "max_level": 0}
 
 async def set_levelup_channel(guild_id, channel_id):
     async with aiosqlite.connect(DATABASE) as db:
-        await db.execute("""INSERT INTO guild_config (guild_id, levelup_channel_id) VALUES (?,?)
-            ON CONFLICT(guild_id) DO UPDATE SET levelup_channel_id=excluded.levelup_channel_id""", (guild_id, channel_id))
+        await db.execute(
+            """INSERT INTO guild_config (guild_id, levelup_channel_id) VALUES (?,?)
+            ON CONFLICT(guild_id) DO UPDATE SET levelup_channel_id=excluded.levelup_channel_id""",
+            (guild_id, channel_id)
+        )
         await db.commit()
 
 async def set_admin_roles(guild_id, role_ids):
     async with aiosqlite.connect(DATABASE) as db:
-        await db.execute("""INSERT INTO guild_config (guild_id, admin_roles) VALUES (?,?)
-            ON CONFLICT(guild_id) DO UPDATE SET admin_roles=excluded.admin_roles""", (guild_id, json.dumps(role_ids)))
+        await db.execute(
+            """INSERT INTO guild_config (guild_id, admin_roles) VALUES (?,?)
+            ON CONFLICT(guild_id) DO UPDATE SET admin_roles=excluded.admin_roles""",
+            (guild_id, json.dumps(role_ids))
+        )
         await db.commit()
 
 async def set_max_level(guild_id, max_level):
     async with aiosqlite.connect(DATABASE) as db:
-        await db.execute("""INSERT INTO guild_config (guild_id, max_level) VALUES (?,?)
-            ON CONFLICT(guild_id) DO UPDATE SET max_level=excluded.max_level""", (guild_id, max_level))
+        await db.execute(
+            """INSERT INTO guild_config (guild_id, max_level) VALUES (?,?)
+            ON CONFLICT(guild_id) DO UPDATE SET max_level=excluded.max_level""",
+            (guild_id, max_level)
+        )
         await db.commit()
 
 async def is_channel_ignored(guild_id, channel_id):
     async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute("SELECT 1 FROM ignored_channels WHERE guild_id=? AND channel_id=?", (guild_id, channel_id)) as cur:
+        async with db.execute(
+            "SELECT 1 FROM ignored_channels WHERE guild_id=? AND channel_id=?",
+            (guild_id, channel_id)
+        ) as cur:
             return await cur.fetchone() is not None
 
 async def add_ignored_channel(guild_id, channel_id):
     async with aiosqlite.connect(DATABASE) as db:
-        await db.execute("INSERT OR IGNORE INTO ignored_channels (guild_id, channel_id) VALUES (?,?)", (guild_id, channel_id))
+        await db.execute(
+            "INSERT OR IGNORE INTO ignored_channels (guild_id, channel_id) VALUES (?,?)",
+            (guild_id, channel_id)
+        )
         await db.commit()
 
 async def remove_ignored_channel(guild_id, channel_id):
     async with aiosqlite.connect(DATABASE) as db:
-        await db.execute("DELETE FROM ignored_channels WHERE guild_id=? AND channel_id=?", (guild_id, channel_id))
+        await db.execute(
+            "DELETE FROM ignored_channels WHERE guild_id=? AND channel_id=?",
+            (guild_id, channel_id)
+        )
         await db.commit()
 
 async def get_ignored_channels(guild_id):
     async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute("SELECT channel_id FROM ignored_channels WHERE guild_id=?", (guild_id,)) as cur:
+        async with db.execute(
+            "SELECT channel_id FROM ignored_channels WHERE guild_id=?",
+            (guild_id,)
+        ) as cur:
+            return [r[0] for r in await cur.fetchall()]
+
+async def set_max_level(guild_id, max_level):
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute(
+            """INSERT INTO guild_config (guild_id, max_level) VALUES (?,?)
+            ON CONFLICT(guild_id) DO UPDATE SET max_level=excluded.max_level""",
+            (guild_id, max_level)
+        )
+        await db.commit()
+
+async def is_channel_ignored(guild_id, channel_id):
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute(
+            "SELECT 1 FROM ignored_channels WHERE guild_id=? AND channel_id=?",
+            (guild_id, channel_id)
+        ) as cur:
+            return await cur.fetchone() is not None
+
+async def add_ignored_channel(guild_id, channel_id):
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO ignored_channels (guild_id, channel_id) VALUES (?,?)",
+            (guild_id, channel_id)
+        )
+        await db.commit()
+
+async def remove_ignored_channel(guild_id, channel_id):
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute(
+            "DELETE FROM ignored_channels WHERE guild_id=? AND channel_id=?",
+            (guild_id, channel_id)
+        )
+        await db.commit()
+
+async def get_ignored_channels(guild_id):
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute(
+            "SELECT channel_id FROM ignored_channels WHERE guild_id=?",
+            (guild_id,)
+        ) as cur:
             return [r[0] for r in await cur.fetchall()]
 
 async def add_class(guild_id, class_name):
     async with aiosqlite.connect(DATABASE) as db:
         try:
-            await db.execute("INSERT INTO classes (guild_id, class_name) VALUES (?,?)", (guild_id, class_name))
+            await db.execute(
+                "INSERT INTO classes (guild_id, class_name) VALUES (?,?)",
+                (guild_id, class_name)
+            )
             await db.commit()
             return True
-        except:
+        except Exception:
             return False
 
 async def remove_class(guild_id, class_name):
@@ -205,85 +293,261 @@ async def remove_class(guild_id, class_name):
 
 async def get_classes(guild_id):
     async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute("SELECT class_name FROM classes WHERE guild_id=? ORDER BY class_name", (guild_id,)) as cur:
+        async with db.execute(
+            "SELECT class_name FROM classes WHERE guild_id=? ORDER BY class_name",
+            (guild_id,)
+        ) as cur:
             return [r[0] for r in await cur.fetchall()]
 
 async def class_exists(guild_id, class_name):
     async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute("SELECT 1 FROM classes WHERE guild_id=? AND class_name=?", (guild_id, class_name)) as cur:
+        async with db.execute(
+            "SELECT 1 FROM classes WHERE guild_id=? AND class_name=?",
+            (guild_id, class_name)
+        ) as cur:
             return await cur.fetchone() is not None
 
 async def set_rewards(guild_id, class_name, level, rewards):
     async with aiosqlite.connect(DATABASE) as db:
-        await db.execute("""INSERT INTO class_rewards (guild_id, class_name, level, rewards) VALUES (?,?,?,?)
+        await db.execute(
+            """INSERT INTO class_rewards (guild_id, class_name, level, rewards) VALUES (?,?,?,?)
             ON CONFLICT(guild_id, class_name, level) DO UPDATE SET rewards=excluded.rewards""",
-            (guild_id, class_name, level, json.dumps(rewards)))
+            (guild_id, class_name, level, json.dumps(rewards))
+        )
         await db.commit()
 
 async def get_rewards(guild_id, class_name, level):
     async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute("SELECT rewards FROM class_rewards WHERE guild_id=? AND class_name=? AND level=?", (guild_id, class_name, level)) as cur:
+        async with db.execute(
+            "SELECT rewards FROM class_rewards WHERE guild_id=? AND class_name=? AND level=?",
+            (guild_id, class_name, level)
+        ) as cur:
             row = await cur.fetchone()
             return json.loads(row[0]) if row else []
 
 async def get_all_rewards(guild_id, class_name):
     async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute("SELECT level, rewards FROM class_rewards WHERE guild_id=? AND class_name=? ORDER BY level", (guild_id, class_name)) as cur:
+        async with db.execute(
+            "SELECT level, rewards FROM class_rewards WHERE guild_id=? AND class_name=? ORDER BY level",
+            (guild_id, class_name)
+        ) as cur:
             return {r[0]: json.loads(r[1]) for r in await cur.fetchall()}
 
 async def delete_rewards(guild_id, class_name, level):
     async with aiosqlite.connect(DATABASE) as db:
-        await db.execute("DELETE FROM class_rewards WHERE guild_id=? AND class_name=? AND level=?", (guild_id, class_name, level))
+        await db.execute(
+            "DELETE FROM class_rewards WHERE guild_id=? AND class_name=? AND level=?",
+            (guild_id, class_name, level)
+        )
         await db.commit()
 
 async def get_user_class(guild_id, user_id):
     async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute("SELECT class_name FROM user_class WHERE guild_id=? AND user_id=?", (guild_id, user_id)) as cur:
+        async with db.execute(
+            "SELECT class_name FROM user_class WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id)
+        ) as cur:
             row = await cur.fetchone()
             return row[0] if row else None
 
 async def set_user_class(guild_id, user_id, class_name):
     async with aiosqlite.connect(DATABASE) as db:
-        await db.execute("""INSERT INTO user_class (guild_id, user_id, class_name) VALUES (?,?,?)
-            ON CONFLICT(guild_id, user_id) DO UPDATE SET class_name=excluded.class_name""", (guild_id, user_id, class_name))
+        await db.execute(
+            """INSERT INTO user_class (guild_id, user_id, class_name) VALUES (?,?,?)
+            ON CONFLICT(guild_id, user_id) DO UPDATE SET class_name=excluded.class_name""",
+            (guild_id, user_id, class_name)
+        )
         await db.commit()
 
 async def remove_user_class(guild_id, user_id):
     async with aiosqlite.connect(DATABASE) as db:
-        await db.execute("DELETE FROM user_class WHERE guild_id=? AND user_id=?", (guild_id, user_id))
+        await db.execute(
+            "DELETE FROM user_class WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id)
+        )
         await db.commit()
 
 async def add_auto_message(guild_id, trigger, responses, channel_ids):
     async with aiosqlite.connect(DATABASE) as db:
-        await db.execute("INSERT INTO auto_messages (guild_id, trigger_word, responses, channel_ids) VALUES (?,?,?,?)",
-            (guild_id, trigger.lower(), json.dumps(responses), json.dumps(channel_ids)))
+        await db.execute(
+            "INSERT INTO auto_messages (guild_id, trigger_word, responses, channel_ids) VALUES (?,?,?,?)",
+            (guild_id, trigger.lower(), json.dumps(responses), json.dumps(channel_ids))
+        )
         await db.commit()
 
 async def get_auto_messages(guild_id):
     async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute("SELECT id, trigger_word, responses, channel_ids FROM auto_messages WHERE guild_id=?", (guild_id,)) as cur:
-            return [{"id": r[0], "trigger": r[1], "responses": json.loads(r[2]), "channels": json.loads(r[3])} for r in await cur.fetchall()]
+        async with db.execute(
+            "SELECT id, trigger_word, responses, channel_ids FROM auto_messages WHERE guild_id=?",
+            (guild_id,)
+        ) as cur:
+            return [
+                {"id": r[0], "trigger": r[1], "responses": json.loads(r[2]), "channels": json.loads(r[3])}
+                for r in await cur.fetchall()
+            ]
 
 async def delete_auto_message(guild_id, msg_id):
     async with aiosqlite.connect(DATABASE) as db:
-        await db.execute("DELETE FROM auto_messages WHERE guild_id=? AND id=?", (guild_id, msg_id))
+        await db.execute(
+            "DELETE FROM auto_messages WHERE guild_id=? AND id=?",
+            (guild_id, msg_id)
+        )
         await db.commit()
 
 async def add_scheduled_message(guild_id, channel_id, content, send_at, embed_data=None):
     async with aiosqlite.connect(DATABASE) as db:
-        await db.execute("INSERT INTO scheduled_messages (guild_id, channel_id, content, embed_data, send_at) VALUES (?,?,?,?,?)",
-            (guild_id, channel_id, content, embed_data, send_at))
+        await db.execute(
+            "INSERT INTO scheduled_messages (guild_id, channel_id, content, embed_data, send_at) VALUES (?,?,?,?,?)",
+            (guild_id, channel_id, content, embed_data, send_at)
+        )
         await db.commit()
 
 async def get_pending_scheduled():
     async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute("SELECT id, guild_id, channel_id, content, embed_data, send_at FROM scheduled_messages WHERE sent=0") as cur:
+        async with db.execute(
+            "SELECT id, guild_id, channel_id, content, embed_data, send_at FROM scheduled_messages WHERE sent=0"
+        ) as cur:
             return await cur.fetchall()
 
 async def mark_scheduled_sent(msg_id):
     async with aiosqlite.connect(DATABASE) as db:
         await db.execute("UPDATE scheduled_messages SET sent=1 WHERE id=?", (msg_id,))
         await db.commit()
+
+# ---------- ECONOMY / INVENTORY / SHOPS ----------
+async def get_money(guild_id, user_id):
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute(
+            "SELECT money FROM economy WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id)
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+async def set_money(guild_id, user_id, amount):
+    amount = max(0, int(amount))
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute(
+            """INSERT INTO economy (guild_id, user_id, money) VALUES (?,?,?)
+            ON CONFLICT(guild_id, user_id) DO UPDATE SET money=excluded.money""",
+            (guild_id, user_id, amount)
+        )
+        await db.commit()
+    return amount
+
+async def add_money(guild_id, user_id, amount):
+    current = await get_money(guild_id, user_id)
+    return await set_money(guild_id, user_id, current + amount)
+
+async def get_inventory(guild_id, user_id):
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute(
+            "SELECT item_name, quantity FROM inventory WHERE guild_id=? AND user_id=? AND quantity>0 ORDER BY item_name",
+            (guild_id, user_id)
+        ) as cur:
+            return await cur.fetchall()
+
+async def get_item_qty(guild_id, user_id, item_name):
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute(
+            "SELECT quantity FROM inventory WHERE guild_id=? AND user_id=? AND item_name=?",
+            (guild_id, user_id, item_name)
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+async def add_item(guild_id, user_id, item_name, quantity):
+    current = await get_item_qty(guild_id, user_id, item_name)
+    new_qty = max(0, current + quantity)
+    async with aiosqlite.connect(DATABASE) as db:
+        if new_qty == 0:
+            await db.execute(
+                "DELETE FROM inventory WHERE guild_id=? AND user_id=? AND item_name=?",
+                (guild_id, user_id, item_name)
+            )
+        else:
+            await db.execute(
+                """INSERT INTO inventory (guild_id, user_id, item_name, quantity) VALUES (?,?,?,?)
+                ON CONFLICT(guild_id, user_id, item_name) DO UPDATE SET quantity=excluded.quantity""",
+                (guild_id, user_id, item_name, new_qty)
+            )
+        await db.commit()
+    return new_qty
+
+async def create_shop(guild_id, name):
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute(
+            "SELECT 1 FROM shops WHERE guild_id=? AND name=?",
+            (guild_id, name)
+        ) as cur:
+            if await cur.fetchone():
+                return False
+        await db.execute("INSERT INTO shops (guild_id, name) VALUES (?,?)", (guild_id, name))
+        await db.commit()
+        return True
+
+async def delete_shop(guild_id, name):
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute(
+            "SELECT id FROM shops WHERE guild_id=? AND name=?",
+            (guild_id, name)
+        ) as cur:
+            row = await cur.fetchone()
+            if not row:
+                return False
+            shop_id = row[0]
+        await db.execute("DELETE FROM shop_items WHERE shop_id=?", (shop_id,))
+        await db.execute("DELETE FROM shops WHERE id=?", (shop_id,))
+        await db.commit()
+        return True
+
+async def get_shops(guild_id):
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute(
+            "SELECT id, name FROM shops WHERE guild_id=? ORDER BY name",
+            (guild_id,)
+        ) as cur:
+            return await cur.fetchall()
+
+async def get_shop_by_name(guild_id, name):
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute(
+            "SELECT id, name FROM shops WHERE guild_id=? AND name=?",
+            (guild_id, name)
+        ) as cur:
+            return await cur.fetchone()
+
+async def add_shop_item(shop_id, item_name, price, description=""):
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute(
+            "INSERT INTO shop_items (shop_id, item_name, price, description) VALUES (?,?,?,?)",
+            (shop_id, item_name, price, description)
+        )
+        await db.commit()
+
+async def remove_shop_item(shop_id, item_name):
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute(
+            "DELETE FROM shop_items WHERE shop_id=? AND item_name=?",
+            (shop_id, item_name)
+        )
+        await db.commit()
+
+async def get_shop_items(shop_id):
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute(
+            "SELECT item_name, price, description FROM shop_items WHERE shop_id=? ORDER BY item_name",
+            (shop_id,)
+        ) as cur:
+            return await cur.fetchall()
+
+async def get_shop_item(shop_id, item_name):
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute(
+            "SELECT item_name, price, description FROM shop_items WHERE shop_id=? AND item_name=?",
+            (shop_id, item_name)
+        ) as cur:
+            return await cur.fetchone()
 
 async def has_admin_permission(interaction):
     if interaction.user.guild_permissions.administrator:
@@ -314,7 +578,8 @@ async def on_ready():
 @tasks.loop(seconds=30)
 async def check_scheduled():
     now = datetime.now(timezone.utc)
-    for msg_id, guild_id, channel_id, content, embed_data, send_at in await get_pending_scheduled():
+    pending = await get_pending_scheduled()
+    for msg_id, guild_id, channel_id, content, embed_data, send_at in pending:
         try:
             send_time = datetime.fromisoformat(send_at)
             if send_time.tzinfo is None:
@@ -333,13 +598,14 @@ async def check_scheduled():
 async def on_message(message):
     if not message.guild or not message.content:
         return
+    if bot.user and message.author.id == bot.user.id:
+        return
 
     content = message.content.strip()
     content_lower = content.lower()
-
-    # CALCULADORA
-    math_pattern = r'^[\d\s\+\-\*\/\×\÷\^\(\)\.\%]+$'
     clean = content.replace(" ", "")
+
+    math_pattern = r"^[\d\s\+\-\*\/\×\÷\^\(\)\.\%]+$"
     if re.match(math_pattern, clean) and any(op in content for op in "+-*/×÷^%"):
         result = safe_eval(content)
         if result is not None:
@@ -348,22 +614,21 @@ async def on_message(message):
             await message.reply(f"**{content} = {result}**", mention_author=False)
             return
 
-    # DADOS
-    dice_match = re.search(r'(\d{1,3})d(\d{1,5})', content_lower)
+    dice_match = re.fullmatch(r"(\d{1,3})d(\d{1,5})", content_lower.replace(" ", ""))
     if dice_match:
         num_dice = int(dice_match.group(1))
         sides = int(dice_match.group(2))
-        if 1 <= num_dice <= 100 and 2 <= sides <= 100000:
+        if 1 <= num_dice <= 50 and 2 <= sides <= 100000:
             results = [random.randint(1, sides) for _ in range(num_dice)]
             total = sum(results)
             if num_dice == 1:
-                await message.reply(f"🎲 **{num_dice}d{sides}** = **{results[0]}**", mention_author=False)
+                text = f"🎲 **{num_dice}d{sides}** = **{results[0]}**"
             else:
-                details = ", ".join(map(str, results))
-                await message.reply(f"🎲 **{num_dice}d{sides}** = [{details}] → **Total: {total}**", mention_author=False)
+                details = ", ".join(str(n) for n in results)
+                text = f"🎲 **{num_dice}d{sides}** → {details}\n**Total: {total}**"
+            await message.reply(text, mention_author=False)
             return
 
-    # ELIGE
     if content_lower.startswith("elige:"):
         options = [opt.strip() for opt in content[6:].split(",") if opt.strip()]
         if len(options) >= 2:
@@ -371,15 +636,14 @@ async def on_message(message):
             await message.reply(f"🎯 **He elegido:** {chosen}", mention_author=False)
             return
 
-    # MENSAJES AUTOMÁTICOS
     for auto in await get_auto_messages(message.guild.id):
-        if auto["trigger"] in content_lower:
+        if auto["trigger"] and auto["trigger"] in content_lower:
             if auto["channels"] and message.channel.id not in auto["channels"]:
                 continue
-            await message.channel.send(random.choice(auto["responses"]))
+            if auto["responses"]:
+                await message.channel.send(random.choice(auto["responses"]))
             break
 
-    # XP
     if message.author.bot:
         return
 
@@ -422,11 +686,15 @@ async def send_levelup_message(guild, member, level, class_name):
     )
     embed.set_thumbnail(url=member.display_avatar.url)
     if rewards:
-        embed.add_field(name=f"🎁 Has desbloqueado en el nivel {level}:", value="\n".join(f"• {r}" for r in rewards), inline=False)
+        embed.add_field(
+            name=f"🎁 Has desbloqueado en el nivel {level}:",
+            value="\n".join(f"• {r}" for r in rewards),
+            inline=False
+        )
     embed.set_footer(text="Level Up • Creado por 《JEFP25》")
     try:
         await channel.send(content=member.mention, embed=embed)
-    except:
+    except Exception:
         pass
 
 @tree.command(name="rank", description="Muestra tu nivel y XP")
@@ -438,7 +706,9 @@ async def rank(interaction: discord.Interaction, usuario: discord.Member = None)
     next_level_xp = xp_for_level(current_level + 1)
     xp_needed = max(0, next_level_xp - current_xp)
     prev_xp = xp_for_level(current_level)
-    progress = max(0, min(1, (current_xp - prev_xp) / (next_level_xp - prev_xp) if next_level_xp > prev_xp else 0))
+    progress = 0
+    if next_level_xp > prev_xp:
+        progress = max(0, min(1, (current_xp - prev_xp) / (next_level_xp - prev_xp)))
     bar = "█" * int(12 * progress) + "░" * (12 - int(12 * progress))
     embed = discord.Embed(title=f"📊 Rank de {target.display_name}", color=discord.Color.blurple())
     embed.set_thumbnail(url=target.display_avatar.url)
@@ -446,14 +716,18 @@ async def rank(interaction: discord.Interaction, usuario: discord.Member = None)
     embed.add_field(name="XP Total", value=f"**{current_xp:,}**", inline=True)
     embed.add_field(name="Siguiente nivel", value=f"**{xp_needed:,}** XP", inline=True)
     embed.add_field(name="Clase", value=user_class or "❌ Sin clase", inline=True)
+    embed.add_field(name="Dinero", value=f"**{await get_money(interaction.guild_id, target.id):,}**", inline=True)
     embed.add_field(name="Progreso", value=f"`{bar}` {int(progress*100)}%", inline=False)
     embed.set_footer(text="Creado por 《JEFP25》")
     await interaction.response.send_message(embed=embed)
 
-@tree.command(name="leaderboard", description="Top 10 del servidor")
+@tree.command(name="leaderboard", description="Top 10 de XP del servidor")
 async def leaderboard(interaction: discord.Interaction):
     async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute("SELECT user_id, xp, level FROM users WHERE guild_id=? ORDER BY xp DESC LIMIT 10", (interaction.guild_id,)) as cur:
+        async with db.execute(
+            "SELECT user_id, xp, level FROM users WHERE guild_id=? ORDER BY xp DESC LIMIT 10",
+            (interaction.guild_id,)
+        ) as cur:
             rows = await cur.fetchall()
     if not rows:
         await interaction.response.send_message("Aún no hay datos.", ephemeral=True)
@@ -465,8 +739,9 @@ async def leaderboard(interaction: discord.Interaction):
         member = interaction.guild.get_member(user_id)
         name = member.display_name if member else f"Usuario {user_id}"
         user_class = await get_user_class(interaction.guild_id, user_id)
-        description += f"{medal} {name}{f' ({user_class})' if user_class else ''} — Nivel **{level}** ({xp:,} XP)\n"
-    embed = discord.Embed(title="🏆 Leaderboard", description=description, color=discord.Color.gold())
+        extra = f" ({user_class})" if user_class else ""
+        description += f"{medal} {name}{extra} — Nivel **{level}** ({xp:,} XP)\n"
+    embed = discord.Embed(title="🏆 Leaderboard XP", description=description, color=discord.Color.gold())
     embed.set_footer(text="Creado por 《JEFP25》")
     await interaction.response.send_message(embed=embed)
 
@@ -485,7 +760,10 @@ async def elegir_clase(interaction: discord.Interaction, clase: str):
 @tree.command(name="mi-clase", description="Muestra tu clase actual")
 async def mi_clase(interaction: discord.Interaction):
     user_class = await get_user_class(interaction.guild_id, interaction.user.id)
-    await interaction.response.send_message(f"🛡️ Tu clase es: **{user_class}**" if user_class else "❌ No tienes clase. Usa `/elegir-clase`.")
+    if user_class:
+        await interaction.response.send_message(f"🛡️ Tu clase es: **{user_class}**")
+    else:
+        await interaction.response.send_message("❌ No tienes clase. Usa `/elegir-clase`.")
 
 @tree.command(name="ver-lista", description="Ver recompensas de una clase")
 async def ver_lista(interaction: discord.Interaction, clase: str = None):
@@ -506,12 +784,135 @@ async def ver_lista(interaction: discord.Interaction, clase: str = None):
     embed.set_footer(text="Creado por 《JEFP25》")
     await interaction.response.send_message(embed=embed)
 
-@tree.command(name="help", description="Lista de comandos")
+@tree.command(name="dinero", description="Muestra tu dinero o el de otro usuario")
+async def dinero(interaction: discord.Interaction, usuario: discord.Member = None):
+    target = usuario or interaction.user
+    amount = await get_money(interaction.guild_id, target.id)
+    await interaction.response.send_message(f"💰 {target.mention} tiene **{amount:,}** monedas.")
+
+@tree.command(name="top-dinero", description="Top 10 de dinero del servidor")
+async def top_dinero(interaction: discord.Interaction):
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute(
+            "SELECT user_id, money FROM economy WHERE guild_id=? ORDER BY money DESC LIMIT 10",
+            (interaction.guild_id,)
+        ) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        await interaction.response.send_message("Aún no hay economía en el servidor.")
+        return
+    description = ""
+    medals = ["🥇", "🥈", "🥉"]
+    for i, (user_id, money) in enumerate(rows):
+        medal = medals[i] if i < 3 else f"**{i+1}.**"
+        member = interaction.guild.get_member(user_id)
+        name = member.display_name if member else f"Usuario {user_id}"
+        description += f"{medal} {name} — **{money:,}** monedas\n"
+    embed = discord.Embed(title="💰 Top Economía", description=description, color=discord.Color.gold())
+    embed.set_footer(text="Creado por 《JEFP25》")
+    await interaction.response.send_message(embed=embed)
+
+@tree.command(name="inventario", description="Muestra tu inventario o el de otro usuario")
+async def inventario(interaction: discord.Interaction, usuario: discord.Member = None):
+    target = usuario or interaction.user
+    items = await get_inventory(interaction.guild_id, target.id)
+    if not items:
+        await interaction.response.send_message(f"🎒 El inventario de {target.mention} está vacío.")
+        return
+    text = "\n".join(f"• **{name}** ×{qty}" for name, qty in items)
+    embed = discord.Embed(title=f"🎒 Inventario de {target.display_name}", description=text, color=discord.Color.green())
+    embed.set_footer(text="Creado por 《JEFP25》")
+    await interaction.response.send_message(embed=embed)
+
+@tree.command(name="pagar", description="Dale dinero a otro jugador")
+async def pagar(interaction: discord.Interaction, usuario: discord.Member, cantidad: app_commands.Range[int, 1, 100000000]):
+    if usuario.id == interaction.user.id:
+        await interaction.response.send_message("❌ No puedes pagarte a ti mismo.", ephemeral=True)
+        return
+    if usuario.bot:
+        await interaction.response.send_message("❌ No puedes pagarle a un bot.", ephemeral=True)
+        return
+    current = await get_money(interaction.guild_id, interaction.user.id)
+    if current < cantidad:
+        await interaction.response.send_message(f"❌ No tienes suficiente dinero. Tienes **{current:,}**.", ephemeral=True)
+        return
+    await add_money(interaction.guild_id, interaction.user.id, -cantidad)
+    await add_money(interaction.guild_id, usuario.id, cantidad)
+    await interaction.response.send_message(f"✅ {interaction.user.mention} le dio **{cantidad:,}** monedas a {usuario.mention}.")
+
+@tree.command(name="dar-item", description="Dale un ítem de tu inventario a otro jugador")
+async def dar_item(interaction: discord.Interaction, usuario: discord.Member, item: str, cantidad: app_commands.Range[int, 1, 1000] = 1):
+    if usuario.id == interaction.user.id:
+        await interaction.response.send_message("❌ No puedes dártelo a ti mismo.", ephemeral=True)
+        return
+    if usuario.bot:
+        await interaction.response.send_message("❌ No puedes dárselo a un bot.", ephemeral=True)
+        return
+    have = await get_item_qty(interaction.guild_id, interaction.user.id, item)
+    if have < cantidad:
+        await interaction.response.send_message(f"❌ No tienes suficientes **{item}**. Tienes **{have}**.", ephemeral=True)
+        return
+    await add_item(interaction.guild_id, interaction.user.id, item, -cantidad)
+    await add_item(interaction.guild_id, usuario.id, item, cantidad)
+    await interaction.response.send_message(f"✅ {interaction.user.mention} le dio **{item}** ×{cantidad} a {usuario.mention}.")
+
+@tree.command(name="tiendas", description="Lista las tiendas del servidor")
+async def tiendas(interaction: discord.Interaction):
+    shops = await get_shops(interaction.guild_id)
+    if not shops:
+        await interaction.response.send_message("No hay tiendas creadas.")
+        return
+    text = "\n".join(f"• **{name}**" for _sid, name in shops)
+    embed = discord.Embed(title="🛒 Tiendas", description=text, color=discord.Color.orange())
+    embed.set_footer(text="Usa /ver-tienda para ver los productos")
+    await interaction.response.send_message(embed=embed)
+
+@tree.command(name="ver-tienda", description="Muestra los productos de una tienda")
+async def ver_tienda(interaction: discord.Interaction, tienda: str):
+    shop = await get_shop_by_name(interaction.guild_id, tienda)
+    if not shop:
+        await interaction.response.send_message("❌ Esa tienda no existe.", ephemeral=True)
+        return
+    items = await get_shop_items(shop[0])
+    if not items:
+        await interaction.response.send_message(f"La tienda **{tienda}** no tiene productos.")
+        return
+    text = ""
+    for name, price, desc in items:
+        extra = f" — {desc}" if desc else ""
+        text += f"• **{name}** — {price:,} monedas{extra}\n"
+    embed = discord.Embed(title=f"🛒 {tienda}", description=text, color=discord.Color.orange())
+    embed.set_footer(text="Usa /comprar para comprar")
+    await interaction.response.send_message(embed=embed)
+
+@tree.command(name="comprar", description="Compra un ítem de una tienda")
+async def comprar(interaction: discord.Interaction, tienda: str, item: str, cantidad: app_commands.Range[int, 1, 100] = 1):
+    shop = await get_shop_by_name(interaction.guild_id, tienda)
+    if not shop:
+        await interaction.response.send_message("❌ Esa tienda no existe.", ephemeral=True)
+        return
+    product = await get_shop_item(shop[0], item)
+    if not product:
+        await interaction.response.send_message("❌ Ese ítem no está en esa tienda.", ephemeral=True)
+        return
+    price = product[1] * cantidad
+    money = await get_money(interaction.guild_id, interaction.user.id)
+    if money < price:
+        await interaction.response.send_message(f"❌ Te faltan monedas. Cuesta **{price:,}** y tienes **{money:,}**.", ephemeral=True)
+        return
+    await add_money(interaction.guild_id, interaction.user.id, -price)
+    await add_item(interaction.guild_id, interaction.user.id, product[0], cantidad)
+    await interaction.response.send_message(f"✅ Compraste **{product[0]}** ×{cantidad} por **{price:,}** monedas.")
+
+@tree.command(name="help", description="Lista de todos los comandos")
 async def help_command(interaction: discord.Interaction):
-    embed = discord.Embed(title="📖 Level Up - Comandos", color=discord.Color.blue())
+    embed = discord.Embed(title="📖 Level Up - Comandos", description="Bot de niveles, economía, tiendas e inventario.", color=discord.Color.blue())
     embed.add_field(name="👤 Usuario", value="`/rank` `/leaderboard` `/elegir-clase` `/mi-clase` `/ver-lista` `/help`", inline=False)
-    embed.add_field(name="🎲 Utilidades (escribe en el chat)", value="`1d20` `3d6` `Elige: sí, no, tal vez`\n`1+2` `10*5` `25%`", inline=False)
-    embed.add_field(name="🛡️ Admin", value="`/dar-xp` `/quitar-xp` `/ver-xp` `/dar-xp-rol` `/quitar-xp-rol` `/resetear-xp` `/resetear-xp-rol`\n`/añadir-clase` `/borrar-clase` `/añadir-recompensa` `/borrar-recompensa` `/resetear-clase` `/set-nivel-maximo`\n`/embed` `/programar-mensaje` `/auto-mensaje` `/auto-lista` `/auto-borrar`", inline=False)
+    embed.add_field(name="💰 Economía", value="`/dinero` `/top-dinero` `/inventario` `/pagar` `/dar-item` `/tiendas` `/ver-tienda` `/comprar`", inline=False)
+    embed.add_field(name="🎲 Chat", value="`1d20` `5d60` `Elige: sí, no`\n`1+2` `10%*30`", inline=False)
+    embed.add_field(name="🛡️ Admin XP", value="`/dar-xp` `/quitar-xp` `/ver-xp` `/dar-xp-rol` `/quitar-xp-rol` `/resetear-xp` `/resetear-xp-rol` `/añadir-clase` `/borrar-clase` `/añadir-recompensa` `/borrar-recompensa` `/resetear-clase` `/set-nivel-maximo`", inline=False)
+    embed.add_field(name="🛡️ Admin Economía", value="`/dar-dinero` `/quitar-dinero` `/crear-tienda` `/borrar-tienda` `/item-tienda` `/quitar-item-tienda`", inline=False)
+    embed.add_field(name="🛡️ Mensajes", value="`/embed` `/programar-mensaje` `/auto-mensaje` `/auto-lista` `/auto-borrar`", inline=False)
     embed.add_field(name="⚙️ Config", value="`/config-canal-levelup` `/config-desactivar-levelup` `/config-ignorar-canal` `/config-permitir-canal` `/config-canales-ignorados` `/config-roles-admin` `/config-ver`", inline=False)
     embed.set_footer(text="Creado por 《JEFP25》")
     await interaction.response.send_message(embed=embed)
@@ -621,18 +1022,67 @@ async def set_nivel_maximo(interaction: discord.Interaction, nivel: app_commands
     await set_max_level(interaction.guild_id, nivel)
     await interaction.response.send_message("✅ Límite eliminado." if nivel == 0 else f"✅ Nivel máximo: **{nivel}**")
 
+@tree.command(name="dar-dinero", description="Da dinero a un usuario (admin)")
+@admin_only()
+async def dar_dinero(interaction: discord.Interaction, usuario: discord.Member, cantidad: app_commands.Range[int, 1, 100000000]):
+    new_amount = await add_money(interaction.guild_id, usuario.id, cantidad)
+    await interaction.response.send_message(f"✅ Se dieron **{cantidad:,}** monedas a {usuario.mention}. Ahora tiene **{new_amount:,}**.")
+
+@tree.command(name="quitar-dinero", description="Quita dinero a un usuario (admin)")
+@admin_only()
+async def quitar_dinero(interaction: discord.Interaction, usuario: discord.Member, cantidad: app_commands.Range[int, 1, 100000000]):
+    new_amount = await add_money(interaction.guild_id, usuario.id, -cantidad)
+    await interaction.response.send_message(f"✅ Se quitaron **{cantidad:,}** monedas a {usuario.mention}. Ahora tiene **{new_amount:,}**.")
+
+@tree.command(name="crear-tienda", description="Crea una tienda nueva")
+@admin_only()
+async def crear_tienda(interaction: discord.Interaction, nombre: str):
+    if await create_shop(interaction.guild_id, nombre.strip()):
+        await interaction.response.send_message(f"✅ Tienda **{nombre}** creada.")
+    else:
+        await interaction.response.send_message("❌ Ya existe una tienda con ese nombre.", ephemeral=True)
+
+@tree.command(name="borrar-tienda", description="Borra una tienda y sus productos")
+@admin_only()
+async def borrar_tienda(interaction: discord.Interaction, nombre: str):
+    if await delete_shop(interaction.guild_id, nombre):
+        await interaction.response.send_message(f"✅ Tienda **{nombre}** eliminada.")
+    else:
+        await interaction.response.send_message("❌ Esa tienda no existe.", ephemeral=True)
+
+@tree.command(name="item-tienda", description="Añade un producto a una tienda")
+@admin_only()
+async def item_tienda(interaction: discord.Interaction, tienda: str, item: str, precio: app_commands.Range[int, 1, 100000000], descripcion: str = ""):
+    shop = await get_shop_by_name(interaction.guild_id, tienda)
+    if not shop:
+        await interaction.response.send_message("❌ Esa tienda no existe.", ephemeral=True)
+        return
+    await add_shop_item(shop[0], item, precio, descripcion)
+    await interaction.response.send_message(f"✅ **{item}** añadido a **{tienda}** por **{precio:,}** monedas.")
+
+@tree.command(name="quitar-item-tienda", description="Quita un producto de una tienda")
+@admin_only()
+async def quitar_item_tienda(interaction: discord.Interaction, tienda: str, item: str):
+    shop = await get_shop_by_name(interaction.guild_id, tienda)
+    if not shop:
+        await interaction.response.send_message("❌ Esa tienda no existe.", ephemeral=True)
+        return
+    await remove_shop_item(shop[0], item)
+    await interaction.response.send_message(f"✅ **{item}** eliminado de **{tienda}**.")
+
 @tree.command(name="embed", description="Crea y envía un embed")
 @admin_only()
-@app_commands.describe(canal="Canal destino", titulo="Título", descripcion="Descripción", color="Color hex (ej: FF0000)", footer="Pie de página")
-async def crear_embed(interaction: discord.Interaction, canal: discord.TextChannel, titulo: str = None, descripcion: str = None, color: str = "5865F2", footer: str = None):
+async def crear_embed(interaction: discord.Interaction, canal: discord.TextChannel, titulo: str = None, descripcion: str = None, color: str = "5865F2", footer: str = None, imagen: str = None, thumbnail: str = None):
     try:
         color_value = int(color.replace("#", ""), 16)
-    except:
+    except Exception:
         color_value = 0x5865F2
     embed = discord.Embed(color=color_value)
     if titulo: embed.title = titulo
     if descripcion: embed.description = descripcion
     if footer: embed.set_footer(text=footer)
+    if imagen: embed.set_image(url=imagen)
+    if thumbnail: embed.set_thumbnail(url=thumbnail)
     try:
         await canal.send(embed=embed)
         await interaction.response.send_message(f"✅ Embed enviado en {canal.mention}", ephemeral=True)
@@ -641,7 +1091,6 @@ async def crear_embed(interaction: discord.Interaction, canal: discord.TextChann
 
 @tree.command(name="auto-mensaje", description="Mensaje automático por palabra clave")
 @admin_only()
-@app_commands.describe(palabra="Palabra que activa", respuestas="Respuestas separadas por |", canales="IDs de canales separados por coma (vacío = todos)")
 async def auto_mensaje(interaction: discord.Interaction, palabra: str, respuestas: str, canales: str = None):
     resp_list = [r.strip() for r in respuestas.split("|") if r.strip()]
     if not resp_list:
@@ -674,12 +1123,11 @@ async def auto_borrar(interaction: discord.Interaction, id: int):
 
 @tree.command(name="programar-mensaje", description="Programa un mensaje")
 @admin_only()
-@app_commands.describe(canal="Canal", mensaje="Texto del mensaje", fecha="Fecha UTC: YYYY-MM-DD HH:MM")
 async def programar_mensaje(interaction: discord.Interaction, canal: discord.TextChannel, mensaje: str, fecha: str):
     try:
         send_at = datetime.strptime(fecha, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
     except ValueError:
-        await interaction.response.send_message("❌ Formato: `YYYY-MM-DD HH:MM` (ej: 2026-09-20 18:30)", ephemeral=True)
+        await interaction.response.send_message("❌ Formato: `YYYY-MM-DD HH:MM`", ephemeral=True)
         return
     if send_at < datetime.now(timezone.utc):
         await interaction.response.send_message("❌ La fecha debe ser futura.", ephemeral=True)
@@ -693,7 +1141,7 @@ async def config_canal_levelup(interaction: discord.Interaction, canal: discord.
     await set_levelup_channel(interaction.guild_id, canal.id)
     await interaction.response.send_message(f"✅ Canal de level up: {canal.mention}")
 
-@tree.command(name="config-desactivar-levelup", description="Desactiva level up messages")
+@tree.command(name="config-desactivar-levelup", description="Desactiva mensajes de level up")
 @admin_only()
 async def config_desactivar_levelup(interaction: discord.Interaction):
     await set_levelup_channel(interaction.guild_id, None)
@@ -736,9 +1184,11 @@ async def config_roles_admin(interaction: discord.Interaction, rol1: discord.Rol
 async def config_ver(interaction: discord.Interaction):
     config = await get_guild_config(interaction.guild_id)
     classes = await get_classes(interaction.guild_id)
+    shops = await get_shops(interaction.guild_id)
     embed = discord.Embed(title="⚙️ Configuración", color=discord.Color.blue())
     embed.add_field(name="Nivel máximo", value=str(config["max_level"]) if config["max_level"] else "Sin límite", inline=True)
     embed.add_field(name="Clases", value=", ".join(classes) if classes else "Ninguna", inline=False)
+    embed.add_field(name="Tiendas", value=", ".join(n for _i, n in shops) if shops else "Ninguna", inline=False)
     embed.set_footer(text="Creado por 《JEFP25》")
     await interaction.response.send_message(embed=embed)
 
