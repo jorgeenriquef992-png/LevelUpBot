@@ -922,7 +922,7 @@ async def usar_item(interaction: discord.Interaction, item: str, cantidad: app_c
 
 @tree.command(name="help", description="Lista de todos los comandos")
 async def help_command(interaction: discord.Interaction):
-    embed = discord.Embed(title="📖 Level Up - Comandos", description="Bot de niveles, economía, tiendas e inventario.", color=discord.color=discord.Color.green.())
+    embed = discord.Embed(title="📖 Level Up - Comandos", description="Bot de niveles, economía, tiendas e inventario.", color=discord.Color.green.())
     embed.add_field(name="👤 Usuario", value="`/rank` `/leaderboard` `/elegir-clase` `/mi-clase` `/ver-lista` `/help`", inline=False)
     embed.add_field(name="💰 Economía", value="`/dinero` `/top-dinero` `/inventario` `/pagar` `/dar-item` `/usar` `/tiendas` `/ver-tienda` `/comprar`", inline=False)
     embed.add_field(name="🎲 Chat", value="`1d20` `5d60` `Elige: sí, no`\n`1+2` `10%*30`", inline=False)
