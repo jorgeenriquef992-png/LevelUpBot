@@ -904,11 +904,27 @@ async def comprar(interaction: discord.Interaction, tienda: str, item: str, cant
     await add_item(interaction.guild_id, interaction.user.id, product[0], cantidad)
     await interaction.response.send_message(f"✅ Compraste **{product[0]}** ×{cantidad} por **{price:,}** monedas.")
 
+@tree.command(name="usar", description="Usa un objeto de tu inventario")
+@app_commands.describe(item="Nombre del ítem", cantidad="Cantidad a usar (por defecto 1)")
+async def usar_item(interaction: discord.Interaction, item: str, cantidad: app_commands.Range[int, 1, 100] = 1):
+    have = await get_item_qty(interaction.guild_id, interaction.user.id, item)
+    if have < cantidad:
+        await interaction.response.send_message(
+            f"❌ No tienes suficientes **{item}**. Tienes **{have}**.",
+            ephemeral=True
+        )
+        return
+
+    await add_item(interaction.guild_id, interaction.user.id, item, -cantidad)
+    await interaction.response.send_message(
+        f"✅ {interaction.user.mention} usó **{item}** ×{cantidad}."
+    )
+
 @tree.command(name="help", description="Lista de todos los comandos")
 async def help_command(interaction: discord.Interaction):
-    embed = discord.Embed(title="📖 Level Up - Comandos", description="Bot de niveles, economía, tiendas e inventario.", color=discord.Color.blue())
+    embed = discord.Embed(title="📖 Level Up - Comandos", description="Bot de niveles, economía, tiendas e inventario.", color=discord.color=discord.Color.green.())
     embed.add_field(name="👤 Usuario", value="`/rank` `/leaderboard` `/elegir-clase` `/mi-clase` `/ver-lista` `/help`", inline=False)
-    embed.add_field(name="💰 Economía", value="`/dinero` `/top-dinero` `/inventario` `/pagar` `/dar-item` `/tiendas` `/ver-tienda` `/comprar`", inline=False)
+    embed.add_field(name="💰 Economía", value="`/dinero` `/top-dinero` `/inventario` `/pagar` `/dar-item` `/usar` `/tiendas` `/ver-tienda` `/comprar`", inline=False)
     embed.add_field(name="🎲 Chat", value="`1d20` `5d60` `Elige: sí, no`\n`1+2` `10%*30`", inline=False)
     embed.add_field(name="🛡️ Admin XP", value="`/dar-xp` `/quitar-xp` `/ver-xp` `/dar-xp-rol` `/quitar-xp-rol` `/resetear-xp` `/resetear-xp-rol` `/añadir-clase` `/borrar-clase` `/añadir-recompensa` `/borrar-recompensa` `/resetear-clase` `/set-nivel-maximo`", inline=False)
     embed.add_field(name="🛡️ Admin Economía", value="`/dar-dinero` `/quitar-dinero` `/crear-tienda` `/borrar-tienda` `/item-tienda` `/quitar-item-tienda`", inline=False)
