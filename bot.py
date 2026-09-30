@@ -10,6 +10,7 @@ import ast
 import operator
 from datetime import datetime, timezone
 from dotenv import load_dotenv
+from deep_translator import GoogleTranslator
 
 load_dotenv()
 
@@ -563,6 +564,27 @@ def admin_only():
         return True
     return app_commands.check(predicate)
 
+def es_probablemente_espanol(texto: str) -> bool:
+    t = texto.lower()
+    # Si tiene signos/palabras muy típicas del español, lo tratamos como español
+    marcadores = ["ñ", "¿", "¡", "ción", "mente", "porque", "también", "está", "esto", "hola", "gracias"]
+    return any(m in t for m in marcadores)
+
+async def traducir_a_espanol(texto: str) -> str | None:
+    try:
+        # Si ya parece español, no traducimos
+        if es_probablemente_espanol(texto):
+            return None
+        resultado = GoogleTranslator(source="auto", target="es").translate(texto)
+        if not resultado:
+            return None
+        # Si la traducción salió casi igual, no molestar
+        if resultado.strip().lower() == texto.strip().lower():
+            return None
+        return resultado
+    except Exception:
+        return None
+
 @bot.event
 async def on_ready():
     await init_db()
@@ -601,6 +623,20 @@ async def on_message(message):
     if bot.user and message.author.id == bot.user.id:
         return
 
+# Traducción automática (solo mensajes de usuarios, no del bot)
+    if not message.author.bot and len(message.content.strip()) >= 3:
+        # Evitar traducir comandos slash residuales o puro spam corto
+        if not message.content.startswith(("http://", "https://", "/", "!")):
+            traduccion = await traducir_a_espanol(message.content)
+            if traduccion:
+                try:
+                    await message.reply(
+                        f"🌐 **Traducción:** {traduccion}",
+                        mention_author=False
+                    )
+                except Exception:
+                    pass
+    
     content = message.content.strip()
     content_lower = content.lower()
     clean = content.replace(" ", "")
@@ -920,12 +956,29 @@ async def usar_item(interaction: discord.Interaction, item: str, cantidad: app_c
         f"✅ {interaction.user.mention} usó **{item}** ×{cantidad}."
     )
 
+@tree.command(name="traducir", description="Traduce un texto al español")
+@app_commands.describe(texto="Texto que quieres traducir")
+async def traducir_cmd(interaction: discord.Interaction, texto: str):
+    await interaction.response.defer()
+    try:
+        resultado = GoogleTranslator(source="auto", target="es").translate(texto)
+        if not resultado:
+            await interaction.followup.send("❌ No pude traducir ese texto.")
+            return
+        embed = discord.Embed(title="🌐 Traducción", color=discord.Color.blue())
+        embed.add_field(name="Original", value=texto[:1000], inline=False)
+        embed.add_field(name="Español", value=resultado[:1000], inline=False)
+        embed.set_footer(text="Creado por 《JEFP25》")
+        await interaction.followup.send(embed=embed)
+    except Exception:
+        await interaction.followup.send("❌ Error al traducir. Inténtalo de nuevo.")
+
 @tree.command(name="help", description="Lista de todos los comandos")
 async def help_command(interaction: discord.Interaction):
     embed = discord.Embed(title="📖 Level Up - Comandos", description="Bot de niveles, economía, tiendas e inventario.", color=discord.Color.blue())
     embed.add_field(name="👤 Usuario", value="`/rank` `/leaderboard` `/elegir-clase` `/mi-clase` `/ver-lista` `/help`", inline=False)
     embed.add_field(name="💰 Economía", value="`/dinero` `/top-dinero` `/inventario` `/pagar` `/dar-item` `/usar` `/tiendas` `/ver-tienda` `/comprar`", inline=False)
-    embed.add_field(name="🎲 Chat", value="`1d20` `5d60` `Elige: sí, no`\n`1+2` `10%*30`", inline=False)
+    embed.add_field(name="🎲 Utilidades",value="`1d20` `5d60` `Elige: sí, no`\n`1+2` `10%*30` `/traducir`",inline=False)
     embed.add_field(name="🛡️ Admin XP", value="`/dar-xp` `/quitar-xp` `/ver-xp` `/dar-xp-rol` `/quitar-xp-rol` `/resetear-xp` `/resetear-xp-rol` `/añadir-clase` `/borrar-clase` `/añadir-recompensa` `/borrar-recompensa` `/resetear-clase` `/set-nivel-maximo`", inline=False)
     embed.add_field(name="🛡️ Admin Economía", value="`/dar-dinero` `/quitar-dinero` `/crear-tienda` `/borrar-tienda` `/item-tienda` `/quitar-item-tienda`", inline=False)
     embed.add_field(name="🛡️ Mensajes", value="`/embed` `/programar-mensaje` `/auto-mensaje` `/auto-lista` `/auto-borrar`", inline=False)
