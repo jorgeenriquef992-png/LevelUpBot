@@ -10,7 +10,6 @@ import ast
 import operator
 from datetime import datetime, timezone
 from dotenv import load_dotenv
-from deep_translator import GoogleTranslator
 
 load_dotenv()
 
@@ -190,47 +189,6 @@ async def set_admin_roles(guild_id, role_ids):
             (guild_id, json.dumps(role_ids))
         )
         await db.commit()
-
-async def set_max_level(guild_id, max_level):
-    async with aiosqlite.connect(DATABASE) as db:
-        await db.execute(
-            """INSERT INTO guild_config (guild_id, max_level) VALUES (?,?)
-            ON CONFLICT(guild_id) DO UPDATE SET max_level=excluded.max_level""",
-            (guild_id, max_level)
-        )
-        await db.commit()
-
-async def is_channel_ignored(guild_id, channel_id):
-    async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute(
-            "SELECT 1 FROM ignored_channels WHERE guild_id=? AND channel_id=?",
-            (guild_id, channel_id)
-        ) as cur:
-            return await cur.fetchone() is not None
-
-async def add_ignored_channel(guild_id, channel_id):
-    async with aiosqlite.connect(DATABASE) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO ignored_channels (guild_id, channel_id) VALUES (?,?)",
-            (guild_id, channel_id)
-        )
-        await db.commit()
-
-async def remove_ignored_channel(guild_id, channel_id):
-    async with aiosqlite.connect(DATABASE) as db:
-        await db.execute(
-            "DELETE FROM ignored_channels WHERE guild_id=? AND channel_id=?",
-            (guild_id, channel_id)
-        )
-        await db.commit()
-
-async def get_ignored_channels(guild_id):
-    async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute(
-            "SELECT channel_id FROM ignored_channels WHERE guild_id=?",
-            (guild_id,)
-        ) as cur:
-            return [r[0] for r in await cur.fetchall()]
 
 async def set_max_level(guild_id, max_level):
     async with aiosqlite.connect(DATABASE) as db:
@@ -550,6 +508,34 @@ async def get_shop_item(shop_id, item_name):
         ) as cur:
             return await cur.fetchone()
 
+
+async def shop_autocomplete(interaction: discord.Interaction, current: str):
+    shops = await get_shops(interaction.guild_id)
+    names = [name for _sid, name in shops]
+    current = (current or "").lower()
+    filtered = [n for n in names if current in n.lower()][:25]
+    return [app_commands.Choice(name=n, value=n) for n in filtered]
+
+async def shop_item_autocomplete(interaction: discord.Interaction, current: str):
+    tienda = getattr(interaction.namespace, "tienda", None)
+    if not tienda:
+        return []
+    shop = await get_shop_by_name(interaction.guild_id, tienda)
+    if not shop:
+        return []
+    items = await get_shop_items(shop[0])
+    names = [name for name, _price, _desc in items]
+    current = (current or "").lower()
+    filtered = [n for n in names if current in n.lower()][:25]
+    return [app_commands.Choice(name=n, value=n) for n in filtered]
+
+async def inventory_item_autocomplete(interaction: discord.Interaction, current: str):
+    items = await get_inventory(interaction.guild_id, interaction.user.id)
+    names = [name for name, _qty in items]
+    current = (current or "").lower()
+    filtered = [n for n in names if current in n.lower()][:25]
+    return [app_commands.Choice(name=n, value=n) for n in filtered]
+
 async def has_admin_permission(interaction):
     if interaction.user.guild_permissions.administrator:
         return True
@@ -563,27 +549,6 @@ def admin_only():
             return False
         return True
     return app_commands.check(predicate)
-
-def es_probablemente_espanol(texto: str) -> bool:
-    t = texto.lower()
-    # Si tiene signos/palabras muy típicas del español, lo tratamos como español
-    marcadores = ["ñ", "¿", "¡", "ción", "mente", "porque", "también", "está", "esto", "hola", "gracias"]
-    return any(m in t for m in marcadores)
-
-async def traducir_a_espanol(texto: str) -> str | None:
-    try:
-        # Si ya parece español, no traducimos
-        if es_probablemente_espanol(texto):
-            return None
-        resultado = GoogleTranslator(source="auto", target="es").translate(texto)
-        if not resultado:
-            return None
-        # Si la traducción salió casi igual, no molestar
-        if resultado.strip().lower() == texto.strip().lower():
-            return None
-        return resultado
-    except Exception:
-        return None
 
 @bot.event
 async def on_ready():
@@ -620,27 +585,16 @@ async def check_scheduled():
 async def on_message(message):
     if not message.guild or not message.content:
         return
+
+    # Evita bucles infinitos: NUNCA procesar mensajes del propio bot
     if bot.user and message.author.id == bot.user.id:
         return
 
-# Traducción automática (solo mensajes de usuarios, no del bot)
-    if not message.author.bot and len(message.content.strip()) >= 3:
-        # Evitar traducir comandos slash residuales o puro spam corto
-        if not message.content.startswith(("http://", "https://", "/", "!")):
-            traduccion = await traducir_a_espanol(message.content)
-            if traduccion:
-                try:
-                    await message.reply(
-                        f"🌐 **Traducción:** {traduccion}",
-                        mention_author=False
-                    )
-                except Exception:
-                    pass
-    
     content = message.content.strip()
     content_lower = content.lower()
     clean = content.replace(" ", "")
 
+    # CALCULADORA (Tupperbox sí, nuestro bot no)
     math_pattern = r"^[\d\s\+\-\*\/\×\÷\^\(\)\.\%]+$"
     if re.match(math_pattern, clean) and any(op in content for op in "+-*/×÷^%"):
         result = safe_eval(content)
@@ -650,6 +604,7 @@ async def on_message(message):
             await message.reply(f"**{content} = {result}**", mention_author=False)
             return
 
+    # DADOS: un solo mensaje. Solo si el mensaje ES el dado (evita re-disparos)
     dice_match = re.fullmatch(r"(\d{1,3})d(\d{1,5})", content_lower.replace(" ", ""))
     if dice_match:
         num_dice = int(dice_match.group(1))
@@ -665,6 +620,7 @@ async def on_message(message):
             await message.reply(text, mention_author=False)
             return
 
+    # ELIGE
     if content_lower.startswith("elige:"):
         options = [opt.strip() for opt in content[6:].split(",") if opt.strip()]
         if len(options) >= 2:
@@ -672,6 +628,7 @@ async def on_message(message):
             await message.reply(f"🎯 **He elegido:** {chosen}", mention_author=False)
             return
 
+    # MENSAJES AUTOMÁTICOS (no responder a nuestro bot)
     for auto in await get_auto_messages(message.guild.id):
         if auto["trigger"] and auto["trigger"] in content_lower:
             if auto["channels"] and message.channel.id not in auto["channels"]:
@@ -680,6 +637,7 @@ async def on_message(message):
                 await message.channel.send(random.choice(auto["responses"]))
             break
 
+    # XP solo usuarios reales
     if message.author.bot:
         return
 
@@ -733,6 +691,7 @@ async def send_levelup_message(guild, member, level, class_name):
     except Exception:
         pass
 
+# ==================== USUARIO ====================
 @tree.command(name="rank", description="Muestra tu nivel y XP")
 async def rank(interaction: discord.Interaction, usuario: discord.Member = None):
     target = usuario or interaction.user
@@ -788,7 +747,10 @@ async def elegir_clase(interaction: discord.Interaction, clase: str):
         return
     if not await class_exists(interaction.guild_id, clase):
         clases = await get_classes(interaction.guild_id)
-        await interaction.response.send_message(f"❌ No existe. Disponibles: {', '.join(clases) or 'Ninguna'}", ephemeral=True)
+        await interaction.response.send_message(
+            f"❌ No existe. Disponibles: {', '.join(clases) or 'Ninguna'}",
+            ephemeral=True
+        )
         return
     await set_user_class(interaction.guild_id, interaction.user.id, clase)
     await interaction.response.send_message(f"✅ Has elegido la clase **{clase}**.")
@@ -815,11 +777,89 @@ async def ver_lista(interaction: discord.Interaction, clase: str = None):
     if not rewards:
         await interaction.response.send_message(f"La clase **{clase}** no tiene recompensas.")
         return
-    description = "".join(f"**Nivel {lv}:**\n" + "\n".join(f"  • {r}" for r in rw) + "\n\n" for lv, rw in sorted(rewards.items()))
+    description = "".join(
+        f"**Nivel {lv}:**\n" + "\n".join(f"  • {r}" for r in rw) + "\n\n"
+        for lv, rw in sorted(rewards.items())
+    )
     embed = discord.Embed(title=f"📜 Recompensas de {clase}", description=description, color=discord.Color.purple())
     embed.set_footer(text="Creado por 《JEFP25》")
     await interaction.response.send_message(embed=embed)
 
+@tree.command(name="help", description="Lista de todos los comandos")
+async def help_command(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="📖 Level Up - Comandos",
+        description="Bot de niveles, economía, tiendas e inventario.",
+        color=discord.Color.blue()
+    )
+    embed.add_field(
+        name="👤 Usuario",
+        value=(
+            "`/rank` Nivel, XP, clase y dinero\n"
+            "`/leaderboard` Top 10 de XP\n"
+            "`/elegir-clase` Elegir clase (una vez)\n"
+            "`/mi-clase` Ver tu clase\n"
+            "`/ver-lista` Recompensas de una clase\n"
+            "`/help` Esta lista"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="💰 Economía e inventario",
+        value=(
+            "`/dinero` Ver tu dinero o el de otro\n"
+            "`/top-dinero` Ranking de dinero\n"
+            "`/inventario` Ver inventario\n"
+            "`/pagar` Dar dinero a otro jugador\n"
+            "`/dar-item` Dar un ítem de tu inventario\n"
+            "`/tiendas` Lista de tiendas\n"
+            "`/ver-tienda` Ver ítems de una tienda\n"
+            "`/comprar` Comprar un ítem"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="🎲 Utilidades (escríbelo en el chat)",
+        value="`1d20` `5d60` `Elige: sí, no, tal vez`\n`1+2` `10*5` `10%*30`",
+        inline=False
+    )
+    embed.add_field(
+        name="🛡️ Admin - XP y clases",
+        value=(
+            "`/dar-xp` `/quitar-xp` `/ver-xp` `/dar-xp-rol` `/quitar-xp-rol`\n"
+            "`/resetear-xp` `/resetear-xp-rol`\n"
+            "`/añadir-clase` `/borrar-clase` `/añadir-recompensa` `/borrar-recompensa`\n"
+            "`/resetear-clase` `/set-nivel-maximo`"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="🛡️ Admin - Economía y tiendas",
+        value=(
+            "`/dar-dinero` `/quitar-dinero`\n"
+            "`/crear-tienda` `/borrar-tienda`\n"
+            "`/item-tienda` `/quitar-item-tienda`"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="🛡️ Admin - Mensajes",
+        value="`/embed` `/programar-mensaje` `/auto-mensaje` `/auto-lista` `/auto-borrar`",
+        inline=False
+    )
+    embed.add_field(
+        name="⚙️ Config",
+        value=(
+            "`/config-canal-levelup` `/config-desactivar-levelup`\n"
+            "`/config-ignorar-canal` `/config-permitir-canal` `/config-canales-ignorados`\n"
+            "`/config-roles-admin` `/config-ver`"
+        ),
+        inline=False
+    )
+    embed.set_footer(text="Creado por 《JEFP25》")
+    await interaction.response.send_message(embed=embed)
+
+# ==================== ECONOMÍA USUARIO ====================
 @tree.command(name="dinero", description="Muestra tu dinero o el de otro usuario")
 async def dinero(interaction: discord.Interaction, usuario: discord.Member = None):
     target = usuario or interaction.user
@@ -856,11 +896,16 @@ async def inventario(interaction: discord.Interaction, usuario: discord.Member =
         await interaction.response.send_message(f"🎒 El inventario de {target.mention} está vacío.")
         return
     text = "\n".join(f"• **{name}** ×{qty}" for name, qty in items)
-    embed = discord.Embed(title=f"🎒 Inventario de {target.display_name}", description=text, color=discord.Color.green())
+    embed = discord.Embed(
+        title=f"🎒 Inventario de {target.display_name}",
+        description=text,
+        color=discord.Color.green()
+    )
     embed.set_footer(text="Creado por 《JEFP25》")
     await interaction.response.send_message(embed=embed)
 
 @tree.command(name="pagar", description="Dale dinero a otro jugador")
+@app_commands.describe(usuario="A quién le das dinero", cantidad="Cantidad a dar")
 async def pagar(interaction: discord.Interaction, usuario: discord.Member, cantidad: app_commands.Range[int, 1, 100000000]):
     if usuario.id == interaction.user.id:
         await interaction.response.send_message("❌ No puedes pagarte a ti mismo.", ephemeral=True)
@@ -870,13 +915,20 @@ async def pagar(interaction: discord.Interaction, usuario: discord.Member, canti
         return
     current = await get_money(interaction.guild_id, interaction.user.id)
     if current < cantidad:
-        await interaction.response.send_message(f"❌ No tienes suficiente dinero. Tienes **{current:,}**.", ephemeral=True)
+        await interaction.response.send_message(
+            f"❌ No tienes suficiente dinero. Tienes **{current:,}**.",
+            ephemeral=True
+        )
         return
     await add_money(interaction.guild_id, interaction.user.id, -cantidad)
     await add_money(interaction.guild_id, usuario.id, cantidad)
-    await interaction.response.send_message(f"✅ {interaction.user.mention} le dio **{cantidad:,}** monedas a {usuario.mention}.")
+    await interaction.response.send_message(
+        f"✅ {interaction.user.mention} le dio **{cantidad:,}** monedas a {usuario.mention}."
+    )
 
 @tree.command(name="dar-item", description="Dale un ítem de tu inventario a otro jugador")
+@app_commands.describe(usuario="A quién se lo das", item="Nombre del ítem", cantidad="Cantidad (por defecto 1)")
+@app_commands.autocomplete(item=inventory_item_autocomplete)
 async def dar_item(interaction: discord.Interaction, usuario: discord.Member, item: str, cantidad: app_commands.Range[int, 1, 1000] = 1):
     if usuario.id == interaction.user.id:
         await interaction.response.send_message("❌ No puedes dártelo a ti mismo.", ephemeral=True)
@@ -886,11 +938,16 @@ async def dar_item(interaction: discord.Interaction, usuario: discord.Member, it
         return
     have = await get_item_qty(interaction.guild_id, interaction.user.id, item)
     if have < cantidad:
-        await interaction.response.send_message(f"❌ No tienes suficientes **{item}**. Tienes **{have}**.", ephemeral=True)
+        await interaction.response.send_message(
+            f"❌ No tienes suficientes **{item}**. Tienes **{have}**.",
+            ephemeral=True
+        )
         return
     await add_item(interaction.guild_id, interaction.user.id, item, -cantidad)
     await add_item(interaction.guild_id, usuario.id, item, cantidad)
-    await interaction.response.send_message(f"✅ {interaction.user.mention} le dio **{item}** ×{cantidad} a {usuario.mention}.")
+    await interaction.response.send_message(
+        f"✅ {interaction.user.mention} le dio **{item}** ×{cantidad} a {usuario.mention}."
+    )
 
 @tree.command(name="tiendas", description="Lista las tiendas del servidor")
 async def tiendas(interaction: discord.Interaction):
@@ -904,6 +961,8 @@ async def tiendas(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 @tree.command(name="ver-tienda", description="Muestra los productos de una tienda")
+@app_commands.describe(tienda="Nombre de la tienda")
+@app_commands.autocomplete(tienda=shop_autocomplete)
 async def ver_tienda(interaction: discord.Interaction, tienda: str):
     shop = await get_shop_by_name(interaction.guild_id, tienda)
     if not shop:
@@ -922,6 +981,8 @@ async def ver_tienda(interaction: discord.Interaction, tienda: str):
     await interaction.response.send_message(embed=embed)
 
 @tree.command(name="comprar", description="Compra un ítem de una tienda")
+@app_commands.describe(tienda="Nombre de la tienda", item="Nombre del ítem", cantidad="Cantidad (por defecto 1)")
+@app_commands.autocomplete(tienda=shop_autocomplete, item=shop_item_autocomplete)
 async def comprar(interaction: discord.Interaction, tienda: str, item: str, cantidad: app_commands.Range[int, 1, 100] = 1):
     shop = await get_shop_by_name(interaction.guild_id, tienda)
     if not shop:
@@ -934,58 +995,18 @@ async def comprar(interaction: discord.Interaction, tienda: str, item: str, cant
     price = product[1] * cantidad
     money = await get_money(interaction.guild_id, interaction.user.id)
     if money < price:
-        await interaction.response.send_message(f"❌ Te faltan monedas. Cuesta **{price:,}** y tienes **{money:,}**.", ephemeral=True)
-        return
-    await add_money(interaction.guild_id, interaction.user.id, -price)
-    await add_item(interaction.guild_id, interaction.user.id, product[0], cantidad)
-    await interaction.response.send_message(f"✅ Compraste **{product[0]}** ×{cantidad} por **{price:,}** monedas.")
-
-@tree.command(name="usar", description="Usa un objeto de tu inventario")
-@app_commands.describe(item="Nombre del ítem", cantidad="Cantidad a usar (por defecto 1)")
-async def usar_item(interaction: discord.Interaction, item: str, cantidad: app_commands.Range[int, 1, 100] = 1):
-    have = await get_item_qty(interaction.guild_id, interaction.user.id, item)
-    if have < cantidad:
         await interaction.response.send_message(
-            f"❌ No tienes suficientes **{item}**. Tienes **{have}**.",
+            f"❌ Te faltan monedas. Cuesta **{price:,}** y tienes **{money:,}**.",
             ephemeral=True
         )
         return
-
-    await add_item(interaction.guild_id, interaction.user.id, item, -cantidad)
+    await add_money(interaction.guild_id, interaction.user.id, -price)
+    await add_item(interaction.guild_id, interaction.user.id, product[0], cantidad)
     await interaction.response.send_message(
-        f"✅ {interaction.user.mention} usó **{item}** ×{cantidad}."
+        f"✅ Compraste **{product[0]}** ×{cantidad} por **{price:,}** monedas.\nSe guardó en tu inventario."
     )
 
-@tree.command(name="traducir", description="Traduce un texto al español")
-@app_commands.describe(texto="Texto que quieres traducir")
-async def traducir_cmd(interaction: discord.Interaction, texto: str):
-    await interaction.response.defer()
-    try:
-        resultado = GoogleTranslator(source="auto", target="es").translate(texto)
-        if not resultado:
-            await interaction.followup.send("❌ No pude traducir ese texto.")
-            return
-        embed = discord.Embed(title="🌐 Traducción", color=discord.Color.blue())
-        embed.add_field(name="Original", value=texto[:1000], inline=False)
-        embed.add_field(name="Español", value=resultado[:1000], inline=False)
-        embed.set_footer(text="Creado por 《JEFP25》")
-        await interaction.followup.send(embed=embed)
-    except Exception:
-        await interaction.followup.send("❌ Error al traducir. Inténtalo de nuevo.")
-
-@tree.command(name="help", description="Lista de todos los comandos")
-async def help_command(interaction: discord.Interaction):
-    embed = discord.Embed(title="📖 Level Up - Comandos", description="Bot de niveles, economía, tiendas e inventario.", color=discord.Color.blue())
-    embed.add_field(name="👤 Usuario", value="`/rank` `/leaderboard` `/elegir-clase` `/mi-clase` `/ver-lista` `/help`", inline=False)
-    embed.add_field(name="💰 Economía", value="`/dinero` `/top-dinero` `/inventario` `/pagar` `/dar-item` `/usar` `/tiendas` `/ver-tienda` `/comprar`", inline=False)
-    embed.add_field(name="🎲 Utilidades",value="`1d20` `5d60` `Elige: sí, no`\n`1+2` `10%*30` `/traducir`",inline=False)
-    embed.add_field(name="🛡️ Admin XP", value="`/dar-xp` `/quitar-xp` `/ver-xp` `/dar-xp-rol` `/quitar-xp-rol` `/resetear-xp` `/resetear-xp-rol` `/añadir-clase` `/borrar-clase` `/añadir-recompensa` `/borrar-recompensa` `/resetear-clase` `/set-nivel-maximo`", inline=False)
-    embed.add_field(name="🛡️ Admin Economía", value="`/dar-dinero` `/quitar-dinero` `/crear-tienda` `/borrar-tienda` `/item-tienda` `/quitar-item-tienda`", inline=False)
-    embed.add_field(name="🛡️ Mensajes", value="`/embed` `/programar-mensaje` `/auto-mensaje` `/auto-lista` `/auto-borrar`", inline=False)
-    embed.add_field(name="⚙️ Config", value="`/config-canal-levelup` `/config-desactivar-levelup` `/config-ignorar-canal` `/config-permitir-canal` `/config-canales-ignorados` `/config-roles-admin` `/config-ver`", inline=False)
-    embed.set_footer(text="Creado por 《JEFP25》")
-    await interaction.response.send_message(embed=embed)
-
+# ==================== ADMIN XP ====================
 @tree.command(name="dar-xp", description="Da XP a un usuario")
 @admin_only()
 async def dar_xp(interaction: discord.Interaction, usuario: discord.Member, cantidad: app_commands.Range[int, 1, 1000000]):
@@ -1000,14 +1021,18 @@ async def dar_xp(interaction: discord.Interaction, usuario: discord.Member, cant
 @admin_only()
 async def quitar_xp(interaction: discord.Interaction, usuario: discord.Member, cantidad: app_commands.Range[int, 1, 1000000]):
     new_xp, new_level, _ = await add_xp(interaction.guild_id, usuario.id, -cantidad)
-    await interaction.response.send_message(f"✅ Quitados **{cantidad:,} XP** a {usuario.mention}. Ahora: **{new_xp:,} XP** (Nivel {new_level})")
+    await interaction.response.send_message(
+        f"✅ Quitados **{cantidad:,} XP** a {usuario.mention}. Ahora: **{new_xp:,} XP** (Nivel {new_level})"
+    )
 
 @tree.command(name="ver-xp", description="Ver XP de un usuario")
 @admin_only()
 async def ver_xp(interaction: discord.Interaction, usuario: discord.Member):
     data = await get_user_data(interaction.guild_id, usuario.id)
     user_class = await get_user_class(interaction.guild_id, usuario.id)
-    await interaction.response.send_message(f"📊 {usuario.mention}: **{data['xp']:,} XP** | Nivel **{data['level']}** | Clase: **{user_class or 'Sin clase'}**")
+    await interaction.response.send_message(
+        f"📊 {usuario.mention}: **{data['xp']:,} XP** | Nivel **{data['level']}** | Clase: **{user_class or 'Sin clase'}**"
+    )
 
 @tree.command(name="dar-xp-rol", description="Da XP a un rol")
 @admin_only()
@@ -1067,7 +1092,9 @@ async def añadir_recompensa(interaction: discord.Interaction, clase: str, nivel
         return
     items = [r.strip() for r in recompensas.split("|") if r.strip()]
     await set_rewards(interaction.guild_id, clase, nivel, items)
-    await interaction.response.send_message(f"✅ Recompensas en **{clase}** nivel **{nivel}**:\n" + "\n".join(f"• {i}" for i in items))
+    await interaction.response.send_message(
+        f"✅ Recompensas en **{clase}** nivel **{nivel}**:\n" + "\n".join(f"• {i}" for i in items)
+    )
 
 @tree.command(name="borrar-recompensa", description="Borra recompensas de un nivel")
 @admin_only()
@@ -1091,17 +1118,22 @@ async def set_nivel_maximo(interaction: discord.Interaction, nivel: app_commands
     await set_max_level(interaction.guild_id, nivel)
     await interaction.response.send_message("✅ Límite eliminado." if nivel == 0 else f"✅ Nivel máximo: **{nivel}**")
 
+# ==================== ADMIN ECONOMÍA / TIENDAS ====================
 @tree.command(name="dar-dinero", description="Da dinero a un usuario (admin)")
 @admin_only()
 async def dar_dinero(interaction: discord.Interaction, usuario: discord.Member, cantidad: app_commands.Range[int, 1, 100000000]):
     new_amount = await add_money(interaction.guild_id, usuario.id, cantidad)
-    await interaction.response.send_message(f"✅ Se dieron **{cantidad:,}** monedas a {usuario.mention}. Ahora tiene **{new_amount:,}**.")
+    await interaction.response.send_message(
+        f"✅ Se dieron **{cantidad:,}** monedas a {usuario.mention}. Ahora tiene **{new_amount:,}**."
+    )
 
 @tree.command(name="quitar-dinero", description="Quita dinero a un usuario (admin)")
 @admin_only()
 async def quitar_dinero(interaction: discord.Interaction, usuario: discord.Member, cantidad: app_commands.Range[int, 1, 100000000]):
     new_amount = await add_money(interaction.guild_id, usuario.id, -cantidad)
-    await interaction.response.send_message(f"✅ Se quitaron **{cantidad:,}** monedas a {usuario.mention}. Ahora tiene **{new_amount:,}**.")
+    await interaction.response.send_message(
+        f"✅ Se quitaron **{cantidad:,}** monedas a {usuario.mention}. Ahora tiene **{new_amount:,}**."
+    )
 
 @tree.command(name="crear-tienda", description="Crea una tienda nueva")
 @admin_only()
@@ -1113,6 +1145,8 @@ async def crear_tienda(interaction: discord.Interaction, nombre: str):
 
 @tree.command(name="borrar-tienda", description="Borra una tienda y sus productos")
 @admin_only()
+@app_commands.describe(nombre="Tienda a borrar")
+@app_commands.autocomplete(nombre=shop_autocomplete)
 async def borrar_tienda(interaction: discord.Interaction, nombre: str):
     if await delete_shop(interaction.guild_id, nombre):
         await interaction.response.send_message(f"✅ Tienda **{nombre}** eliminada.")
@@ -1121,6 +1155,8 @@ async def borrar_tienda(interaction: discord.Interaction, nombre: str):
 
 @tree.command(name="item-tienda", description="Añade un producto a una tienda")
 @admin_only()
+@app_commands.describe(tienda="Nombre de la tienda", item="Nombre del ítem", precio="Precio", descripcion="Descripción opcional")
+@app_commands.autocomplete(tienda=shop_autocomplete)
 async def item_tienda(interaction: discord.Interaction, tienda: str, item: str, precio: app_commands.Range[int, 1, 100000000], descripcion: str = ""):
     shop = await get_shop_by_name(interaction.guild_id, tienda)
     if not shop:
@@ -1131,6 +1167,8 @@ async def item_tienda(interaction: discord.Interaction, tienda: str, item: str, 
 
 @tree.command(name="quitar-item-tienda", description="Quita un producto de una tienda")
 @admin_only()
+@app_commands.describe(tienda="Nombre de la tienda", item="Ítem a quitar")
+@app_commands.autocomplete(tienda=shop_autocomplete, item=shop_item_autocomplete)
 async def quitar_item_tienda(interaction: discord.Interaction, tienda: str, item: str):
     shop = await get_shop_by_name(interaction.guild_id, tienda)
     if not shop:
@@ -1139,19 +1177,43 @@ async def quitar_item_tienda(interaction: discord.Interaction, tienda: str, item
     await remove_shop_item(shop[0], item)
     await interaction.response.send_message(f"✅ **{item}** eliminado de **{tienda}**.")
 
+# ==================== EMBEDS / AUTO / PROGRAMADOS ====================
 @tree.command(name="embed", description="Crea y envía un embed")
 @admin_only()
-async def crear_embed(interaction: discord.Interaction, canal: discord.TextChannel, titulo: str = None, descripcion: str = None, color: str = "5865F2", footer: str = None, imagen: str = None, thumbnail: str = None):
+@app_commands.describe(
+    canal="Canal destino",
+    titulo="Título",
+    descripcion="Descripción",
+    color="Color hex (ej: FF0000)",
+    footer="Pie de página",
+    imagen="URL de imagen grande",
+    thumbnail="URL de miniatura"
+)
+async def crear_embed(
+    interaction: discord.Interaction,
+    canal: discord.TextChannel,
+    titulo: str = None,
+    descripcion: str = None,
+    color: str = "5865F2",
+    footer: str = None,
+    imagen: str = None,
+    thumbnail: str = None
+):
     try:
         color_value = int(color.replace("#", ""), 16)
     except Exception:
         color_value = 0x5865F2
     embed = discord.Embed(color=color_value)
-    if titulo: embed.title = titulo
-    if descripcion: embed.description = descripcion
-    if footer: embed.set_footer(text=footer)
-    if imagen: embed.set_image(url=imagen)
-    if thumbnail: embed.set_thumbnail(url=thumbnail)
+    if titulo:
+        embed.title = titulo
+    if descripcion:
+        embed.description = descripcion
+    if footer:
+        embed.set_footer(text=footer)
+    if imagen:
+        embed.set_image(url=imagen)
+    if thumbnail:
+        embed.set_thumbnail(url=thumbnail)
     try:
         await canal.send(embed=embed)
         await interaction.response.send_message(f"✅ Embed enviado en {canal.mention}", ephemeral=True)
@@ -1160,6 +1222,11 @@ async def crear_embed(interaction: discord.Interaction, canal: discord.TextChann
 
 @tree.command(name="auto-mensaje", description="Mensaje automático por palabra clave")
 @admin_only()
+@app_commands.describe(
+    palabra="Palabra que activa",
+    respuestas="Respuestas separadas por |",
+    canales="IDs de canales separados por coma (vacío = todos)"
+)
 async def auto_mensaje(interaction: discord.Interaction, palabra: str, respuestas: str, canales: str = None):
     resp_list = [r.strip() for r in respuestas.split("|") if r.strip()]
     if not resp_list:
@@ -1171,7 +1238,9 @@ async def auto_mensaje(interaction: discord.Interaction, palabra: str, respuesta
             if c.strip().isdigit():
                 channel_ids.append(int(c.strip()))
     await add_auto_message(interaction.guild_id, palabra, resp_list, channel_ids)
-    await interaction.response.send_message(f"✅ Auto-mensaje creado.\nPalabra: `{palabra}`\nRespuestas: {len(resp_list)}")
+    await interaction.response.send_message(
+        f"✅ Auto-mensaje creado.\nPalabra: `{palabra}`\nRespuestas: {len(resp_list)}"
+    )
 
 @tree.command(name="auto-lista", description="Lista mensajes automáticos")
 @admin_only()
@@ -1192,11 +1261,12 @@ async def auto_borrar(interaction: discord.Interaction, id: int):
 
 @tree.command(name="programar-mensaje", description="Programa un mensaje")
 @admin_only()
+@app_commands.describe(canal="Canal", mensaje="Texto del mensaje", fecha="Fecha UTC: YYYY-MM-DD HH:MM")
 async def programar_mensaje(interaction: discord.Interaction, canal: discord.TextChannel, mensaje: str, fecha: str):
     try:
         send_at = datetime.strptime(fecha, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
     except ValueError:
-        await interaction.response.send_message("❌ Formato: `YYYY-MM-DD HH:MM`", ephemeral=True)
+        await interaction.response.send_message("❌ Formato: `YYYY-MM-DD HH:MM` (ej: 2026-09-20 18:30)", ephemeral=True)
         return
     if send_at < datetime.now(timezone.utc):
         await interaction.response.send_message("❌ La fecha debe ser futura.", ephemeral=True)
@@ -1204,6 +1274,7 @@ async def programar_mensaje(interaction: discord.Interaction, canal: discord.Tex
     await add_scheduled_message(interaction.guild_id, canal.id, mensaje, send_at.isoformat())
     await interaction.response.send_message(f"✅ Mensaje programado para **{fecha} UTC** en {canal.mention}")
 
+# ==================== CONFIG ====================
 @tree.command(name="config-canal-levelup", description="Canal de level up")
 @admin_only()
 async def config_canal_levelup(interaction: discord.Interaction, canal: discord.TextChannel):
@@ -1235,7 +1306,10 @@ async def config_canales_ignorados(interaction: discord.Interaction):
     if not channels:
         await interaction.response.send_message("No hay canales ignorados.")
         return
-    mentions = [interaction.guild.get_channel(c).mention if interaction.guild.get_channel(c) else str(c) for c in channels]
+    mentions = []
+    for c in channels:
+        ch = interaction.guild.get_channel(c)
+        mentions.append(ch.mention if ch else str(c))
     await interaction.response.send_message("**Canales ignorados:**\n" + "\n".join(mentions))
 
 @tree.command(name="config-roles-admin", description="Roles de administración")
@@ -1266,4 +1340,4 @@ if __name__ == "__main__":
         print("❌ Falta DISCORD_TOKEN")
     else:
         bot.run(TOKEN)
-
+        
