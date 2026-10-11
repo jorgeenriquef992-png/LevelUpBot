@@ -1,67 +1,22 @@
-import discord
-from discord import app_commands
-from discord.ext import commands, tasks
-import aiosqlite
-import random
 import os
-import json
 import re
 import ast
+import json
+import math
+import random
 import operator
 from datetime import datetime, timezone
+from typing import Optional
+
+import aiosqlite
+import discord
+from discord import app_commands
+from discord.ext import commands
 from dotenv import load_dotenv
 
 load_dotenv()
-
 TOKEN = os.getenv("DISCORD_TOKEN")
-DATABASE = "levelup.db"
-
-XP_MIN = 15
-XP_MAX = 25
-XP_COOLDOWN = 60
-
-def calculate_level(xp: int) -> int:
-    return int(0.1 * (xp ** 0.5))
-
-def xp_for_level(level: int) -> int:
-    return int((level / 0.1) ** 2)
-
-SAFE_OPERATORS = {
-    ast.Add: operator.add,
-    ast.Sub: operator.sub,
-    ast.Mult: operator.mul,
-    ast.Div: operator.truediv,
-    ast.FloorDiv: operator.floordiv,
-    ast.Mod: operator.mod,
-    ast.Pow: operator.pow,
-    ast.USub: operator.neg,
-}
-
-def safe_eval(expr: str):
-    expr = expr.replace("×", "*").replace("÷", "/").replace("^", "**")
-    expr = re.sub(r"(\d+(?:\.\d+)?)%", r"(\1/100)", expr)
-    try:
-        node = ast.parse(expr, mode="eval").body
-        return _eval_node(node)
-    except Exception:
-        return None
-
-def _eval_node(node):
-    if isinstance(node, ast.Constant):
-        return node.value
-    if isinstance(node, ast.Num):
-        return node.n
-    if isinstance(node, ast.BinOp):
-        op = SAFE_OPERATORS.get(type(node.op))
-        if op is None:
-            raise ValueError("Operador no permitido")
-        return op(_eval_node(node.left), _eval_node(node.right))
-    if isinstance(node, ast.UnaryOp):
-        op = SAFE_OPERATORS.get(type(node.op))
-        if op is None:
-            raise ValueError("Operador no permitido")
-        return op(_eval_node(node.operand))
-    raise ValueError("Expresión no permitida")
+DATABASE = "rpg_bot.db"
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -70,453 +25,489 @@ intents.guilds = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
-cooldowns = {}
 
-async def init_db():
-    async with aiosqlite.connect(DATABASE) as db:
-        await db.execute("""CREATE TABLE IF NOT EXISTS users (
-            guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
-            xp INTEGER DEFAULT 0, level INTEGER DEFAULT 0,
-            PRIMARY KEY (guild_id, user_id))""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS guild_config (
-            guild_id INTEGER PRIMARY KEY, levelup_channel_id INTEGER,
-            admin_roles TEXT DEFAULT '[]', max_level INTEGER DEFAULT 0)""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS ignored_channels (
-            guild_id INTEGER NOT NULL, channel_id INTEGER NOT NULL,
-            PRIMARY KEY (guild_id, channel_id))""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS classes (
-            guild_id INTEGER NOT NULL, class_name TEXT NOT NULL,
-            PRIMARY KEY (guild_id, class_name))""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS class_rewards (
-            guild_id INTEGER NOT NULL, class_name TEXT NOT NULL,
-            level INTEGER NOT NULL, rewards TEXT NOT NULL,
-            PRIMARY KEY (guild_id, class_name, level))""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS user_class (
-            guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
-            class_name TEXT NOT NULL, PRIMARY KEY (guild_id, user_id))""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS auto_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL,
-            trigger_word TEXT NOT NULL, responses TEXT NOT NULL,
-            channel_ids TEXT DEFAULT '[]')""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS scheduled_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL,
-            channel_id INTEGER NOT NULL, content TEXT NOT NULL,
-            embed_data TEXT, send_at TEXT NOT NULL, sent INTEGER DEFAULT 0)""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS economy (
-            guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
-            money INTEGER DEFAULT 0, PRIMARY KEY (guild_id, user_id))""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS shops (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            guild_id INTEGER NOT NULL, name TEXT NOT NULL)""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS shop_items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            shop_id INTEGER NOT NULL, item_name TEXT NOT NULL,
-            price INTEGER NOT NULL, description TEXT DEFAULT '')""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS inventory (
-            guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
-            item_name TEXT NOT NULL, quantity INTEGER DEFAULT 0,
-            PRIMARY KEY (guild_id, user_id, item_name))""")
-        await db.commit()
+# ==================== CONSTANTES ====================
+MAX_PJ = 3
+PROFESSION_LEVEL = 10
+RANK_LEVELS = {"C": 10, "B": 20, "A": 30, "S": 50}
+GRADE_ORDER = {"Comun": 0, "Refinado": 1, "Superior": 2, "Magistral": 3}
+RANK_ORDER = {"C": 0, "B": 1, "A": 2, "S": 3}
+GRADE_BY_RANK = {"C": "Comun", "B": "Refinado", "A": "Superior", "S": "Magistral"}
+EFFECTS = ["Sangrado", "Quemadura", "Aturdimiento", "Sueño", "Veneno", "Congelamiento", "Parálisis"]
+ELEMENTS = ["Fuego", "Agua", "Tierra", "Aire", "Ninguno"]
+MESA_BY_PROF = {
+    "Herrero": "Mesa de Herrería",
+    "Artífice": "Mesa de Artífice",
+    "Elixirista": "Mesa de Elixir",
+    "Toxicólogo": "Mesa de Toxicología",
+    "Cocinero": "Mesa de Cocina",
+}
+DEFAULT_STATS = {
+    "VIDA": 20, "VIDA_MAX": 20, "FUE": 5, "VEL": 5,
+    "RES": 5, "DEF": 3, "MANA": 10, "MANA_MAX": 10
+}
 
-# ---------- XP ----------
-async def get_user_data(guild_id, user_id):
-    async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute(
-            "SELECT xp, level FROM users WHERE guild_id=? AND user_id=?",
-            (guild_id, user_id)
-        ) as cur:
-            row = await cur.fetchone()
-            return {"xp": row[0], "level": row[1]} if row else {"xp": 0, "level": 0}
+SAFE_OPS = {
+    ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+    ast.Div: operator.truediv, ast.Pow: operator.pow, ast.USub: operator.neg,
+    ast.Mod: operator.mod,
+}
 
-async def set_user_xp(guild_id, user_id, xp):
-    level = calculate_level(xp)
-    config = await get_guild_config(guild_id)
-    max_level = config.get("max_level", 0)
-    if max_level > 0 and level > max_level:
-        level = max_level
-        xp = xp_for_level(max_level)
-    async with aiosqlite.connect(DATABASE) as db:
-        await db.execute(
-            """INSERT INTO users (guild_id, user_id, xp, level) VALUES (?,?,?,?)
-            ON CONFLICT(guild_id, user_id) DO UPDATE SET xp=excluded.xp, level=excluded.level""",
-            (guild_id, user_id, xp, level)
-        )
-        await db.commit()
+# ==================== UTILIDADES ====================
+def safe_eval(expr: str):
+    expr = expr.replace("×", "*").replace("÷", "/").replace("^", "**")
+    expr = re.sub(r"(\d+(?:\.\d+)?)%", r"(\1/100)", expr)
+    try:
+        node = ast.parse(expr, mode="eval")
+        def _eval(n):
+            if isinstance(n, ast.Expression):
+                return _eval(n.body)
+            if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)):
+                return n.value
+            if isinstance(n, ast.UnaryOp) and type(n.op) in SAFE_OPS:
+                return SAFE_OPS[type(n.op)](_eval(n.operand))
+            if isinstance(n, ast.BinOp) and type(n.op) in SAFE_OPS:
+                return SAFE_OPS[type(n.op)](_eval(n.left), _eval(n.right))
+            raise ValueError("unsafe")
+        return _eval(node)
+    except Exception:
+        return None
+
+def parse_codes(text: str) -> dict:
+    """Extrae códigos tipo $FUE=5 o $DAÑO=3 del texto."""
+    if not text:
+        return {}
+    found = {}
+    for m in re.finditer(r"\$([A-Z_]+)\s*=\s*([^\s,$]+)", text.upper()):
+        key, val = m.group(1), m.group(2)
+        try:
+            if "." in val:
+                found[key] = float(val)
+            else:
+                found[key] = int(val)
+        except ValueError:
+            found[key] = val
+    # También captura $EFECTO=Sangrado sin forzar número
+    for m in re.finditer(r"\$([A-Z_]+)\s*=\s*([A-Za-zÁÉÍÓÚáéíóúñÑ_]+)", text):
+        key = m.group(1).upper()
+        if key not in found:
+            found[key] = m.group(2)
+    return found
+
+def rank_from_level(level: int) -> str:
+    if level >= 50:
+        return "S"
+    if level >= 30:
+        return "A"
+    if level >= 20:
+        return "B"
+    if level >= 10:
+        return "C"
+    return "-"
+
+def xp_for_level(level: int) -> int:
+    return 100 * level * (level + 1) // 2
+
+def calculate_level(xp: int) -> int:
+    level = 0
+    while xp >= xp_for_level(level + 1):
+        level += 1
+        if level > 500:
+            break
     return level
 
-async def add_xp(guild_id, user_id, amount):
-    data = await get_user_data(guild_id, user_id)
-    old_level = data["level"]
-    new_xp = max(0, data["xp"] + amount)
-    config = await get_guild_config(guild_id)
-    max_level = config.get("max_level", 0)
-    if max_level > 0:
-        max_xp = xp_for_level(max_level)
-        if new_xp > max_xp:
-            new_xp = max_xp
-    new_level = await set_user_xp(guild_id, user_id, new_xp)
-    return new_xp, new_level, new_level > old_level
+# ==================== DB ====================
+async def init_db():
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS guild_config (
+                guild_id INTEGER PRIMARY KEY,
+                admin_roles TEXT DEFAULT '[]',
+                xp_channel_id INTEGER,
+                max_level INTEGER DEFAULT 50
+            );
+            CREATE TABLE IF NOT EXISTS classes (
+                guild_id INTEGER,
+                name TEXT,
+                description TEXT DEFAULT '',
+                stats_json TEXT DEFAULT '{}',
+                PRIMARY KEY (guild_id, name)
+            );
+            CREATE TABLE IF NOT EXISTS professions (
+                guild_id INTEGER,
+                name TEXT,
+                description TEXT DEFAULT '',
+                PRIMARY KEY (guild_id, name)
+            );
+            CREATE TABLE IF NOT EXISTS characters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                image_url TEXT DEFAULT '',
+                color INTEGER DEFAULT 5793266,
+                class_name TEXT DEFAULT '',
+                profession TEXT DEFAULT '',
+                level INTEGER DEFAULT 1,
+                xp INTEGER DEFAULT 0,
+                money INTEGER DEFAULT 0,
+                stats_json TEXT DEFAULT '{}',
+                alive INTEGER DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS inventory (
+                character_id INTEGER NOT NULL,
+                item_name TEXT NOT NULL,
+                quantity INTEGER DEFAULT 1,
+                item_type TEXT DEFAULT 'Objeto',
+                data_json TEXT DEFAULT '{}',
+                image_url TEXT DEFAULT '',
+                description TEXT DEFAULT '',
+                PRIMARY KEY (character_id, item_name)
+            );
+            CREATE TABLE IF NOT EXISTS shops (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                name TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS shop_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                shop_id INTEGER NOT NULL,
+                item_name TEXT NOT NULL,
+                price INTEGER NOT NULL,
+                item_type TEXT DEFAULT 'Objeto',
+                description TEXT DEFAULT '',
+                image_url TEXT DEFAULT '',
+                data_json TEXT DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS materials (
+                guild_id INTEGER,
+                name TEXT,
+                description TEXT DEFAULT '',
+                image_url TEXT DEFAULT '',
+                PRIMARY KEY (guild_id, name)
+            );
+            CREATE TABLE IF NOT EXISTS recipes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                profession TEXT NOT NULL,
+                grade TEXT DEFAULT 'Comun',
+                result_name TEXT NOT NULL,
+                result_type TEXT DEFAULT 'Arma',
+                result_data TEXT DEFAULT '{}',
+                materials_json TEXT DEFAULT '{}',
+                needs_magic INTEGER DEFAULT 0,
+                magic_material TEXT DEFAULT '',
+                image_url TEXT DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS level_rewards (
+                guild_id INTEGER,
+                level INTEGER,
+                rewards TEXT DEFAULT '[]',
+                stats_json TEXT DEFAULT '{}',
+                PRIMARY KEY (guild_id, level)
+            );
+            CREATE TABLE IF NOT EXISTS combats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                combat_type TEXT DEFAULT 'amistoso',
+                status TEXT DEFAULT 'active',
+                turn_index INTEGER DEFAULT 0,
+                data_json TEXT DEFAULT '{}',
+                log_json TEXT DEFAULT '[]'
+            );
+            CREATE TABLE IF NOT EXISTS combat_participants (
+                combat_id INTEGER NOT NULL,
+                character_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                team INTEGER DEFAULT 0,
+                role TEXT DEFAULT 'Atacante',
+                vida INTEGER DEFAULT 20,
+                mana INTEGER DEFAULT 10,
+                stats_json TEXT DEFAULT '{}',
+                effects_json TEXT DEFAULT '[]',
+                defending_target INTEGER,
+                alive INTEGER DEFAULT 1,
+                PRIMARY KEY (combat_id, character_id)
+            );
+            """
+        )
+        await db.commit()
 
-async def get_guild_config(guild_id):
+# ==================== GUILD / ADMIN ====================
+async def get_guild_config(guild_id: int) -> dict:
     async with aiosqlite.connect(DATABASE) as db:
         async with db.execute(
-            "SELECT levelup_channel_id, admin_roles, max_level FROM guild_config WHERE guild_id=?",
-            (guild_id,)
+            "SELECT admin_roles, xp_channel_id, max_level FROM guild_config WHERE guild_id=?",
+            (guild_id,),
         ) as cur:
             row = await cur.fetchone()
-            if row:
-                return {
-                    "levelup_channel_id": row[0],
-                    "admin_roles": json.loads(row[1]) if row[1] else [],
-                    "max_level": row[2] or 0
-                }
-            return {"levelup_channel_id": None, "admin_roles": [], "max_level": 0}
+    if not row:
+        return {"admin_roles": [], "xp_channel_id": None, "max_level": 50}
+    return {
+        "admin_roles": json.loads(row[0] or "[]"),
+        "xp_channel_id": row[1],
+        "max_level": row[2] or 50,
+    }
 
-async def set_levelup_channel(guild_id, channel_id):
+async def set_guild_field(guild_id: int, field: str, value):
     async with aiosqlite.connect(DATABASE) as db:
         await db.execute(
-            """INSERT INTO guild_config (guild_id, levelup_channel_id) VALUES (?,?)
-            ON CONFLICT(guild_id) DO UPDATE SET levelup_channel_id=excluded.levelup_channel_id""",
-            (guild_id, channel_id)
+            "INSERT INTO guild_config (guild_id) VALUES (?) ON CONFLICT(guild_id) DO NOTHING",
+            (guild_id,),
         )
+        await db.execute(f"UPDATE guild_config SET {field}=? WHERE guild_id=?", (value, guild_id))
         await db.commit()
 
-async def set_admin_roles(guild_id, role_ids):
-    async with aiosqlite.connect(DATABASE) as db:
-        await db.execute(
-            """INSERT INTO guild_config (guild_id, admin_roles) VALUES (?,?)
-            ON CONFLICT(guild_id) DO UPDATE SET admin_roles=excluded.admin_roles""",
-            (guild_id, json.dumps(role_ids))
-        )
-        await db.commit()
+async def has_admin(interaction: discord.Interaction) -> bool:
+    if interaction.user.guild_permissions.administrator:
+        return True
+    cfg = await get_guild_config(interaction.guild_id)
+    return any(r.id in cfg["admin_roles"] for r in getattr(interaction.user, "roles", []))
 
-async def set_max_level(guild_id, max_level):
-    async with aiosqlite.connect(DATABASE) as db:
-        await db.execute(
-            """INSERT INTO guild_config (guild_id, max_level) VALUES (?,?)
-            ON CONFLICT(guild_id) DO UPDATE SET max_level=excluded.max_level""",
-            (guild_id, max_level)
-        )
-        await db.commit()
-
-async def is_channel_ignored(guild_id, channel_id):
-    async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute(
-            "SELECT 1 FROM ignored_channels WHERE guild_id=? AND channel_id=?",
-            (guild_id, channel_id)
-        ) as cur:
-            return await cur.fetchone() is not None
-
-async def add_ignored_channel(guild_id, channel_id):
-    async with aiosqlite.connect(DATABASE) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO ignored_channels (guild_id, channel_id) VALUES (?,?)",
-            (guild_id, channel_id)
-        )
-        await db.commit()
-
-async def remove_ignored_channel(guild_id, channel_id):
-    async with aiosqlite.connect(DATABASE) as db:
-        await db.execute(
-            "DELETE FROM ignored_channels WHERE guild_id=? AND channel_id=?",
-            (guild_id, channel_id)
-        )
-        await db.commit()
-
-async def get_ignored_channels(guild_id):
-    async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute(
-            "SELECT channel_id FROM ignored_channels WHERE guild_id=?",
-            (guild_id,)
-        ) as cur:
-            return [r[0] for r in await cur.fetchall()]
-
-async def add_class(guild_id, class_name):
-    async with aiosqlite.connect(DATABASE) as db:
-        try:
-            await db.execute(
-                "INSERT INTO classes (guild_id, class_name) VALUES (?,?)",
-                (guild_id, class_name)
-            )
-            await db.commit()
-            return True
-        except Exception:
+def admin_only():
+    async def predicate(interaction: discord.Interaction):
+        if not await has_admin(interaction):
+            await interaction.response.send_message("❌ No tienes permiso de admin.", ephemeral=True)
             return False
+        return True
+    return app_commands.check(predicate)
 
-async def remove_class(guild_id, class_name):
-    async with aiosqlite.connect(DATABASE) as db:
-        await db.execute("DELETE FROM classes WHERE guild_id=? AND class_name=?", (guild_id, class_name))
-        await db.execute("DELETE FROM class_rewards WHERE guild_id=? AND class_name=?", (guild_id, class_name))
-        await db.execute("DELETE FROM user_class WHERE guild_id=? AND class_name=?", (guild_id, class_name))
-        await db.commit()
-
-async def get_classes(guild_id):
+# ==================== PERSONAJES ====================
+async def count_characters(guild_id: int, user_id: int) -> int:
     async with aiosqlite.connect(DATABASE) as db:
         async with db.execute(
-            "SELECT class_name FROM classes WHERE guild_id=? ORDER BY class_name",
-            (guild_id,)
+            "SELECT COUNT(*) FROM characters WHERE guild_id=? AND user_id=? AND alive=1",
+            (guild_id, user_id),
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+async def get_user_characters(guild_id: int, user_id: int):
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute(
+            "SELECT id, name, level, class_name, profession FROM characters WHERE guild_id=? AND user_id=? AND alive=1 ORDER BY id",
+            (guild_id, user_id),
+        ) as cur:
+            return await cur.fetchall()
+
+async def get_character(char_id: int):
+    async with aiosqlite.connect(DATABASE) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM characters WHERE id=?", (char_id,)) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+async def get_class(guild_id: int, name: str):
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute(
+            "SELECT name, description, stats_json FROM classes WHERE guild_id=? AND name=?",
+            (guild_id, name),
+        ) as cur:
+            return await cur.fetchone()
+
+async def list_classes(guild_id: int):
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute(
+            "SELECT name FROM classes WHERE guild_id=? ORDER BY name", (guild_id,)
         ) as cur:
             return [r[0] for r in await cur.fetchall()]
 
-async def class_exists(guild_id, class_name):
+async def list_professions(guild_id: int):
     async with aiosqlite.connect(DATABASE) as db:
         async with db.execute(
-            "SELECT 1 FROM classes WHERE guild_id=? AND class_name=?",
-            (guild_id, class_name)
+            "SELECT name FROM professions WHERE guild_id=? ORDER BY name", (guild_id,)
         ) as cur:
-            return await cur.fetchone() is not None
+            return [r[0] for r in await cur.fetchall()]
 
-async def set_rewards(guild_id, class_name, level, rewards):
-    async with aiosqlite.connect(DATABASE) as db:
-        await db.execute(
-            """INSERT INTO class_rewards (guild_id, class_name, level, rewards) VALUES (?,?,?,?)
-            ON CONFLICT(guild_id, class_name, level) DO UPDATE SET rewards=excluded.rewards""",
-            (guild_id, class_name, level, json.dumps(rewards))
-        )
-        await db.commit()
-
-async def get_rewards(guild_id, class_name, level):
+# ==================== INVENTARIO / ECONOMÍA ====================
+async def get_inventory(char_id: int):
     async with aiosqlite.connect(DATABASE) as db:
         async with db.execute(
-            "SELECT rewards FROM class_rewards WHERE guild_id=? AND class_name=? AND level=?",
-            (guild_id, class_name, level)
+            "SELECT item_name, quantity, item_type, data_json, image_url, description FROM inventory WHERE character_id=? AND quantity>0 ORDER BY item_name",
+            (char_id,),
+        ) as cur:
+            return await cur.fetchall()
+
+async def get_item(char_id: int, item_name: str):
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute(
+            "SELECT item_name, quantity, item_type, data_json, image_url, description FROM inventory WHERE character_id=? AND item_name=?",
+            (char_id, item_name),
+        ) as cur:
+            return await cur.fetchone()
+
+async def add_item(char_id: int, item_name: str, qty: int = 1, item_type="Objeto",
+                   data=None, image_url="", description=""):
+    data = data or {}
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute(
+            "SELECT quantity, data_json FROM inventory WHERE character_id=? AND item_name=?",
+            (char_id, item_name),
         ) as cur:
             row = await cur.fetchone()
-            return json.loads(row[0]) if row else []
-
-async def get_all_rewards(guild_id, class_name):
-    async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute(
-            "SELECT level, rewards FROM class_rewards WHERE guild_id=? AND class_name=? ORDER BY level",
-            (guild_id, class_name)
-        ) as cur:
-            return {r[0]: json.loads(r[1]) for r in await cur.fetchall()}
-
-async def delete_rewards(guild_id, class_name, level):
-    async with aiosqlite.connect(DATABASE) as db:
-        await db.execute(
-            "DELETE FROM class_rewards WHERE guild_id=? AND class_name=? AND level=?",
-            (guild_id, class_name, level)
-        )
+        if row:
+            new_qty = max(0, row[0] + qty)
+            if new_qty == 0:
+                await db.execute(
+                    "DELETE FROM inventory WHERE character_id=? AND item_name=?",
+                    (char_id, item_name),
+                )
+            else:
+                await db.execute(
+                    "UPDATE inventory SET quantity=? WHERE character_id=? AND item_name=?",
+                    (new_qty, char_id, item_name),
+                )
+        else:
+            if qty > 0:
+                await db.execute(
+                    """INSERT INTO inventory (character_id, item_name, quantity, item_type, data_json, image_url, description)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (char_id, item_name, qty, item_type, json.dumps(data), image_url, description),
+                )
         await db.commit()
 
-async def get_user_class(guild_id, user_id):
+async def set_money(char_id: int, amount: int):
+    amount = max(0, int(amount))
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute("UPDATE characters SET money=? WHERE id=?", (amount, char_id))
+        await db.commit()
+    return amount
+
+async def add_money(char_id: int, delta: int):
+    ch = await get_character(char_id)
+    if not ch:
+        return 0
+    return await set_money(char_id, ch["money"] + delta)
+
+# ==================== TIENDA ====================
+async def get_shops(guild_id: int):
     async with aiosqlite.connect(DATABASE) as db:
         async with db.execute(
-            "SELECT class_name FROM user_class WHERE guild_id=? AND user_id=?",
-            (guild_id, user_id)
+            "SELECT id, name FROM shops WHERE guild_id=? ORDER BY name", (guild_id,)
+        ) as cur:
+            return await cur.fetchall()
+
+async def get_shop_by_name(guild_id: int, name: str):
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute(
+            "SELECT id, name FROM shops WHERE guild_id=? AND name=?", (guild_id, name)
+        ) as cur:
+            return await cur.fetchone()
+
+async def get_shop_items(shop_id: int):
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute(
+            "SELECT item_name, price, item_type, description, image_url, data_json FROM shop_items WHERE shop_id=? ORDER BY item_name",
+            (shop_id,),
+        ) as cur:
+            return await cur.fetchall()
+
+async def get_shop_item(shop_id: int, item_name: str):
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute(
+            "SELECT item_name, price, item_type, description, image_url, data_json FROM shop_items WHERE shop_id=? AND item_name=?",
+            (shop_id, item_name),
+        ) as cur:
+            return await cur.fetchone()
+
+# ==================== RECETAS ====================
+async def get_recipes(guild_id: int, profession: str = None):
+    async with aiosqlite.connect(DATABASE) as db:
+        if profession:
+            async with db.execute(
+                "SELECT id, name, profession, grade, result_name, result_type, result_data, materials_json, needs_magic, magic_material, image_url FROM recipes WHERE guild_id=? AND profession=? ORDER BY name",
+                (guild_id, profession),
+            ) as cur:
+                return await cur.fetchall()
+        async with db.execute(
+            "SELECT id, name, profession, grade, result_name, result_type, result_data, materials_json, needs_magic, magic_material, image_url FROM recipes WHERE guild_id=? ORDER BY name",
+            (guild_id,),
+        ) as cur:
+            return await cur.fetchall()
+
+async def get_recipe(recipe_id: int):
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute(
+            "SELECT id, name, profession, grade, result_name, result_type, result_data, materials_json, needs_magic, magic_material, image_url FROM recipes WHERE id=?",
+            (recipe_id,),
+        ) as cur:
+            return await cur.fetchone()
+
+# ==================== COMBATE HELPERS ====================
+async def get_active_combat_for_char(char_id: int):
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute(
+            """SELECT c.id FROM combats c
+               JOIN combat_participants p ON p.combat_id=c.id
+               WHERE p.character_id=? AND c.status='active'""",
+            (char_id,),
         ) as cur:
             row = await cur.fetchone()
             return row[0] if row else None
 
-async def set_user_class(guild_id, user_id, class_name):
+async def get_combat(combat_id: int):
     async with aiosqlite.connect(DATABASE) as db:
-        await db.execute(
-            """INSERT INTO user_class (guild_id, user_id, class_name) VALUES (?,?,?)
-            ON CONFLICT(guild_id, user_id) DO UPDATE SET class_name=excluded.class_name""",
-            (guild_id, user_id, class_name)
-        )
-        await db.commit()
-
-async def remove_user_class(guild_id, user_id):
-    async with aiosqlite.connect(DATABASE) as db:
-        await db.execute(
-            "DELETE FROM user_class WHERE guild_id=? AND user_id=?",
-            (guild_id, user_id)
-        )
-        await db.commit()
-
-async def add_auto_message(guild_id, trigger, responses, channel_ids):
-    async with aiosqlite.connect(DATABASE) as db:
-        await db.execute(
-            "INSERT INTO auto_messages (guild_id, trigger_word, responses, channel_ids) VALUES (?,?,?,?)",
-            (guild_id, trigger.lower(), json.dumps(responses), json.dumps(channel_ids))
-        )
-        await db.commit()
-
-async def get_auto_messages(guild_id):
-    async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute(
-            "SELECT id, trigger_word, responses, channel_ids FROM auto_messages WHERE guild_id=?",
-            (guild_id,)
-        ) as cur:
-            return [
-                {"id": r[0], "trigger": r[1], "responses": json.loads(r[2]), "channels": json.loads(r[3])}
-                for r in await cur.fetchall()
-            ]
-
-async def delete_auto_message(guild_id, msg_id):
-    async with aiosqlite.connect(DATABASE) as db:
-        await db.execute(
-            "DELETE FROM auto_messages WHERE guild_id=? AND id=?",
-            (guild_id, msg_id)
-        )
-        await db.commit()
-
-async def add_scheduled_message(guild_id, channel_id, content, send_at, embed_data=None):
-    async with aiosqlite.connect(DATABASE) as db:
-        await db.execute(
-            "INSERT INTO scheduled_messages (guild_id, channel_id, content, embed_data, send_at) VALUES (?,?,?,?,?)",
-            (guild_id, channel_id, content, embed_data, send_at)
-        )
-        await db.commit()
-
-async def get_pending_scheduled():
-    async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute(
-            "SELECT id, guild_id, channel_id, content, embed_data, send_at FROM scheduled_messages WHERE sent=0"
-        ) as cur:
-            return await cur.fetchall()
-
-async def mark_scheduled_sent(msg_id):
-    async with aiosqlite.connect(DATABASE) as db:
-        await db.execute("UPDATE scheduled_messages SET sent=1 WHERE id=?", (msg_id,))
-        await db.commit()
-
-# ---------- ECONOMY / INVENTORY / SHOPS ----------
-async def get_money(guild_id, user_id):
-    async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute(
-            "SELECT money FROM economy WHERE guild_id=? AND user_id=?",
-            (guild_id, user_id)
-        ) as cur:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM combats WHERE id=?", (combat_id,)) as cur:
             row = await cur.fetchone()
-            return row[0] if row else 0
+            return dict(row) if row else None
 
-async def set_money(guild_id, user_id, amount):
-    amount = max(0, int(amount))
+async def get_participants(combat_id: int):
+    async with aiosqlite.connect(DATABASE) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM combat_participants WHERE combat_id=? ORDER BY team, character_id",
+            (combat_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+async def append_log(combat_id: int, line: str):
+    combat = await get_combat(combat_id)
+    if not combat:
+        return
+    log = json.loads(combat.get("log_json") or "[]")
+    log.append(line)
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute("UPDATE combats SET log_json=? WHERE id=?", (json.dumps(log[-100:]), combat_id))
+        await db.commit()
+
+async def update_participant(combat_id: int, char_id: int, **fields):
+    if not fields:
+        return
+    sets = ", ".join(f"{k}=?" for k in fields)
+    vals = list(fields.values()) + [combat_id, char_id]
     async with aiosqlite.connect(DATABASE) as db:
         await db.execute(
-            """INSERT INTO economy (guild_id, user_id, money) VALUES (?,?,?)
-            ON CONFLICT(guild_id, user_id) DO UPDATE SET money=excluded.money""",
-            (guild_id, user_id, amount)
-        )
-        await db.commit()
-    return amount
-
-async def add_money(guild_id, user_id, amount):
-    current = await get_money(guild_id, user_id)
-    return await set_money(guild_id, user_id, current + amount)
-
-async def get_inventory(guild_id, user_id):
-    async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute(
-            "SELECT item_name, quantity FROM inventory WHERE guild_id=? AND user_id=? AND quantity>0 ORDER BY item_name",
-            (guild_id, user_id)
-        ) as cur:
-            return await cur.fetchall()
-
-async def get_item_qty(guild_id, user_id, item_name):
-    async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute(
-            "SELECT quantity FROM inventory WHERE guild_id=? AND user_id=? AND item_name=?",
-            (guild_id, user_id, item_name)
-        ) as cur:
-            row = await cur.fetchone()
-            return row[0] if row else 0
-
-async def add_item(guild_id, user_id, item_name, quantity):
-    current = await get_item_qty(guild_id, user_id, item_name)
-    new_qty = max(0, current + quantity)
-    async with aiosqlite.connect(DATABASE) as db:
-        if new_qty == 0:
-            await db.execute(
-                "DELETE FROM inventory WHERE guild_id=? AND user_id=? AND item_name=?",
-                (guild_id, user_id, item_name)
-            )
-        else:
-            await db.execute(
-                """INSERT INTO inventory (guild_id, user_id, item_name, quantity) VALUES (?,?,?,?)
-                ON CONFLICT(guild_id, user_id, item_name) DO UPDATE SET quantity=excluded.quantity""",
-                (guild_id, user_id, item_name, new_qty)
-            )
-        await db.commit()
-    return new_qty
-
-async def create_shop(guild_id, name):
-    async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute(
-            "SELECT 1 FROM shops WHERE guild_id=? AND name=?",
-            (guild_id, name)
-        ) as cur:
-            if await cur.fetchone():
-                return False
-        await db.execute("INSERT INTO shops (guild_id, name) VALUES (?,?)", (guild_id, name))
-        await db.commit()
-        return True
-
-async def delete_shop(guild_id, name):
-    async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute(
-            "SELECT id FROM shops WHERE guild_id=? AND name=?",
-            (guild_id, name)
-        ) as cur:
-            row = await cur.fetchone()
-            if not row:
-                return False
-            shop_id = row[0]
-        await db.execute("DELETE FROM shop_items WHERE shop_id=?", (shop_id,))
-        await db.execute("DELETE FROM shops WHERE id=?", (shop_id,))
-        await db.commit()
-        return True
-
-async def get_shops(guild_id):
-    async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute(
-            "SELECT id, name FROM shops WHERE guild_id=? ORDER BY name",
-            (guild_id,)
-        ) as cur:
-            return await cur.fetchall()
-
-async def get_shop_by_name(guild_id, name):
-    async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute(
-            "SELECT id, name FROM shops WHERE guild_id=? AND name=?",
-            (guild_id, name)
-        ) as cur:
-            return await cur.fetchone()
-
-async def add_shop_item(shop_id, item_name, price, description=""):
-    async with aiosqlite.connect(DATABASE) as db:
-        await db.execute(
-            "INSERT INTO shop_items (shop_id, item_name, price, description) VALUES (?,?,?,?)",
-            (shop_id, item_name, price, description)
+            f"UPDATE combat_participants SET {sets} WHERE combat_id=? AND character_id=?",
+            vals,
         )
         await db.commit()
 
-async def remove_shop_item(shop_id, item_name):
-    async with aiosqlite.connect(DATABASE) as db:
-        await db.execute(
-            "DELETE FROM shop_items WHERE shop_id=? AND item_name=?",
-            (shop_id, item_name)
-        )
-        await db.commit()
-
-async def get_shop_items(shop_id):
-    async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute(
-            "SELECT item_name, price, description FROM shop_items WHERE shop_id=? ORDER BY item_name",
-            (shop_id,)
-        ) as cur:
-            return await cur.fetchall()
-
-async def get_shop_item(shop_id, item_name):
-    async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute(
-            "SELECT item_name, price, description FROM shop_items WHERE shop_id=? AND item_name=?",
-            (shop_id, item_name)
-        ) as cur:
-            return await cur.fetchone()
-
-
-async def shop_autocomplete(interaction: discord.Interaction, current: str):
-    shops = await get_shops(interaction.guild_id)
-    names = [name for _sid, name in shops]
+# ==================== AUTOCOMPLETE ====================
+async def ac_user_chars(interaction: discord.Interaction, current: str):
+    chars = await get_user_characters(interaction.guild_id, interaction.user.id)
     current = (current or "").lower()
-    filtered = [n for n in names if current in n.lower()][:25]
-    return [app_commands.Choice(name=n, value=n) for n in filtered]
+    out = []
+    for cid, name, level, cls, prof in chars:
+        label = f"{name} (Nv.{level})"
+        if current in label.lower():
+            out.append(app_commands.Choice(name=label[:100], value=str(cid)))
+    return out[:25]
 
-async def shop_item_autocomplete(interaction: discord.Interaction, current: str):
+async def ac_shops(interaction: discord.Interaction, current: str):
+    shops = await get_shops(interaction.guild_id)
+    current = (current or "").lower()
+    return [
+        app_commands.Choice(name=n, value=n)
+        for _id, n in shops if current in n.lower()
+    ][:25]
+
+async def ac_shop_items(interaction: discord.Interaction, current: str):
     tienda = getattr(interaction.namespace, "tienda", None)
     if not tienda:
         return []
@@ -524,69 +515,302 @@ async def shop_item_autocomplete(interaction: discord.Interaction, current: str)
     if not shop:
         return []
     items = await get_shop_items(shop[0])
-    names = [name for name, _price, _desc in items]
     current = (current or "").lower()
-    filtered = [n for n in names if current in n.lower()][:25]
-    return [app_commands.Choice(name=n, value=n) for n in filtered]
+    return [
+        app_commands.Choice(name=n, value=n)
+        for n, *_ in items if current in n.lower()
+    ][:25]
 
-async def inventory_item_autocomplete(interaction: discord.Interaction, current: str):
-    items = await get_inventory(interaction.guild_id, interaction.user.id)
-    names = [name for name, _qty in items]
+async def ac_inv_items(interaction: discord.Interaction, current: str):
+    pj = getattr(interaction.namespace, "pj", None)
+    if not pj:
+        return []
+    try:
+        char_id = int(pj)
+    except ValueError:
+        return []
+    items = await get_inventory(char_id)
     current = (current or "").lower()
-    filtered = [n for n in names if current in n.lower()][:25]
-    return [app_commands.Choice(name=n, value=n) for n in filtered]
+    return [
+        app_commands.Choice(name=f"{n} x{q}", value=n)
+        for n, q, *_ in items if current in n.lower()
+    ][:25]
 
-async def has_admin_permission(interaction):
-    if interaction.user.guild_permissions.administrator:
-        return True
-    config = await get_guild_config(interaction.guild_id)
-    return any(role.id in config["admin_roles"] for role in interaction.user.roles)
+async def ac_classes(interaction: discord.Interaction, current: str):
+    classes = await list_classes(interaction.guild_id)
+    current = (current or "").lower()
+    return [app_commands.Choice(name=c, value=c) for c in classes if current in c.lower()][:25]
 
-def admin_only():
-    async def predicate(interaction):
-        if not await has_admin_permission(interaction):
-            await interaction.response.send_message("❌ No tienes permiso.", ephemeral=True)
+async def ac_professions(interaction: discord.Interaction, current: str):
+    profs = await list_professions(interaction.guild_id)
+    current = (current or "").lower()
+    return [app_commands.Choice(name=p, value=p) for p in profs if current in p.lower()][:25]
+
+# ==================== VIEWS COMBATE ====================
+class CombatView(discord.ui.View):
+    def __init__(self, combat_id: int):
+        super().__init__(timeout=None)
+        self.combat_id = combat_id
+
+    async def _current_actor(self):
+        combat = await get_combat(self.combat_id)
+        if not combat or combat["status"] != "active":
+            return None, None
+        parts = [p for p in await get_participants(self.combat_id) if p["alive"]]
+        if not parts:
+            return combat, None
+        # Orden: quien inicia primero ya está en turn_index; luego por velocidad
+        idx = combat["turn_index"] % len(parts)
+        # Ordenar por VEL desc manteniendo estabilidad
+        parts_sorted = sorted(parts, key=lambda p: (-(json.loads(p["stats_json"]).get("VEL", 0)), p["character_id"]))
+        # turn_index recorre parts_sorted
+        actor = parts_sorted[idx % len(parts_sorted)]
+        return combat, actor
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        combat, actor = await self._current_actor()
+        if not combat or not actor:
+            await interaction.response.send_message("Este combate ya no está activo.", ephemeral=True)
+            return False
+        if interaction.user.id != actor["user_id"]:
+            await interaction.response.send_message("❌ No es tu turno.", ephemeral=True)
             return False
         return True
-    return app_commands.check(predicate)
 
+    @discord.ui.button(label="Atacar", style=discord.ButtonStyle.danger, emoji="⚔️")
+    async def atacar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "Escribe el ataque así:\n`!ataque <id_pj_objetivo> <nombre_arma> | descripción`\n"
+            "Ejemplo: `!ataque 3 Espada de Hierro | Golpeo con fuerza`",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Defender", style=discord.ButtonStyle.primary, emoji="🛡️")
+    async def defender(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "Escribe la defensa así:\n`!defensa <nombre_arma_o_escudo> | descripción`\n"
+            "O si eres tanque protegiendo a alguien:\n`!defensa <id_aliado> <arma> | descripción`",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Esquivar", style=discord.ButtonStyle.secondary, emoji="💨")
+    async def esquivar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "Escribe: `!esquivar | descripción del esquive`",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Inventario", style=discord.ButtonStyle.success, emoji="🎒")
+    async def inventario(self, interaction: discord.Interaction, button: discord.ui.Button):
+        combat, actor = await self._current_actor()
+        if not actor:
+            return
+        items = await get_inventory(actor["character_id"])
+        if not items:
+            await interaction.response.send_message("Inventario vacío.", ephemeral=True)
+            return
+        text = "\n".join(f"• **{n}** x{q} ({t})" for n, q, t, *_ in items)
+        await interaction.response.send_message(
+            f"🎒 Inventario (usa `!usar-combate <item> | descripción`):\n{text}",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Huir", style=discord.ButtonStyle.secondary, emoji="🏃")
+    async def huir(self, interaction: discord.Interaction, button: discord.ui.Button):
+        combat, actor = await self._current_actor()
+        if not combat or not actor:
+            return
+        if combat["combat_type"] == "amistoso":
+            await update_participant(self.combat_id, actor["character_id"], alive=0, vida=0)
+            await append_log(self.combat_id, f"🏃 {actor['character_id']} huyó (amistoso).")
+            await interaction.response.send_message("Has huido. Combate amistoso: pierdes.")
+            await check_combat_end(self.combat_id, interaction.channel)
+        else:
+            roll = random.randint(1, 10)
+            if roll >= 8:
+                await update_participant(self.combat_id, actor["character_id"], alive=0, vida=0)
+                await append_log(self.combat_id, f"🏃 {actor['character_id']} huyó (dado {roll}).")
+                await interaction.response.send_message(f"Dado: **{roll}** — ¡Lograste huir!")
+                await check_combat_end(self.combat_id, interaction.channel)
+            else:
+                await update_participant(self.combat_id, actor["character_id"], alive=0, vida=0)
+                await append_log(self.combat_id, f"💀 {actor['character_id']} falló huida (dado {roll}) y cayó.")
+                await interaction.response.send_message(f"Dado: **{roll}** — Fallaste. Tu vida cae a 0.")
+                await handle_downed(self.combat_id, actor, interaction.channel)
+
+    @discord.ui.button(label="Ver log", style=discord.ButtonStyle.secondary, emoji="📜", row=1)
+    async def ver_log(self, interaction: discord.Interaction, button: discord.ui.Button):
+        combat = await get_combat(self.combat_id)
+        log = json.loads(combat.get("log_json") or "[]")
+        text = "\n".join(log[-20:]) if log else "Sin acciones aún."
+        await interaction.response.send_message(f"📜 **Log del combate**\n{text}", ephemeral=True)
+
+async def advance_turn(combat_id: int, channel):
+    combat = await get_combat(combat_id)
+    if not combat or combat["status"] != "active":
+        return
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute(
+            "UPDATE combats SET turn_index=turn_index+1 WHERE id=?", (combat_id,)
+        )
+        await db.commit()
+    combat, actor = await CombatView(combat_id)._current_actor()
+    if not actor:
+        return
+    ch = await get_character(actor["character_id"])
+    name = ch["name"] if ch else str(actor["character_id"])
+    embed = discord.Embed(
+        title="⚔️ Turno de combate",
+        description=f"Le toca a <@{actor['user_id']}> — **{name}**\nVida: **{actor['vida']}** | Maná: **{actor['mana']}**",
+        color=discord.Color.orange(),
+    )
+    await channel.send(content=f"<@{actor['user_id']}>", embed=embed, view=CombatView(combat_id))
+
+async def handle_downed(combat_id: int, actor: dict, channel):
+    combat = await get_combat(combat_id)
+    ch = await get_character(actor["character_id"])
+    if not combat or not ch:
+        return
+    if combat["combat_type"] == "amistoso":
+        await channel.send(f"💔 **{ch['name']}** ha caído (amistoso). No se elimina el PJ.")
+        await check_combat_end(combat_id, channel)
+        return
+    # Buscar ítem revivir
+    items = await get_inventory(actor["character_id"])
+    revive_item = None
+    for n, q, t, data_json, img, desc in items:
+        data = json.loads(data_json or "{}")
+        if data.get("REVIVIR") or "$REVIVIR" in (desc or "").upper():
+            revive_item = n
+            break
+    if revive_item:
+        view = ReviveView(combat_id, actor["character_id"], revive_item)
+        await channel.send(
+            f"💀 **{ch['name']}** cayó a muerte. ¿Usar **{revive_item}** para revivir?",
+            view=view,
+        )
+    else:
+        await delete_character(actor["character_id"])
+        await channel.send(f"💀 **{ch['name']}** ha muerto y fue eliminado. Cupo liberado.")
+        await check_combat_end(combat_id, channel)
+
+async def delete_character(char_id: int):
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute("DELETE FROM inventory WHERE character_id=?", (char_id,))
+        await db.execute("DELETE FROM characters WHERE id=?", (char_id,))
+        await db.commit()
+
+async def check_combat_end(combat_id: int, channel):
+    parts = await get_participants(combat_id)
+    alive = [p for p in parts if p["alive"]]
+    if len(alive) <= 1:
+        async with aiosqlite.connect(DATABASE) as db:
+            await db.execute("UPDATE combats SET status='ended' WHERE id=?", (combat_id,))
+            await db.commit()
+        if len(alive) == 1:
+            ch = await get_character(alive[0]["character_id"])
+            await channel.send(f"🏆 Combate terminado. Gana **{ch['name'] if ch else 'alguien'}**.")
+        else:
+            await channel.send(" Combate terminado. Nadie queda en pie.")
+        return
+    # Grupo: preguntar si continuar cuando alguien cae — simplificado: auto-continúa
+    await advance_turn(combat_id, channel)
+
+class ReviveView(discord.ui.View):
+    def __init__(self, combat_id: int, char_id: int, item_name: str):
+        super().__init__(timeout=120)
+        self.combat_id = combat_id
+        self.char_id = char_id
+        self.item_name = item_name
+
+    @discord.ui.button(label="Revivir", style=discord.ButtonStyle.success, emoji="✨")
+    async def revivir(self, interaction: discord.Interaction, button: discord.ui.Button):
+        ch = await get_character(self.char_id)
+        if not ch or interaction.user.id != ch["user_id"]:
+            await interaction.response.send_message("No es tu personaje.", ephemeral=True)
+            return
+        item = await get_item(self.char_id, self.item_name)
+        if not item:
+            await interaction.response.send_message("Ya no tienes ese ítem.", ephemeral=True)
+            return
+        await add_item(self.char_id, self.item_name, -1)
+        stats = json.loads(ch["stats_json"] or "{}")
+        vida = stats.get("VIDA_MAX", 20)
+        await update_participant(self.combat_id, self.char_id, alive=1, vida=vida)
+        await append_log(self.combat_id, f"✨ {ch['name']} revivió con {self.item_name}.")
+        async with aiosqlite.connect(DATABASE) as db:
+            await db.execute("UPDATE combats SET status='ended' WHERE id=?", (self.combat_id,))
+            await db.commit()
+        await interaction.response.send_message(f"✨ **{ch['name']}** revive. Combate finalizado.")
+        self.stop()
+
+    @discord.ui.button(label="No revivir", style=discord.ButtonStyle.danger)
+    async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
+        ch = await get_character(self.char_id)
+        if not ch or interaction.user.id != ch["user_id"]:
+            await interaction.response.send_message("No es tu personaje.", ephemeral=True)
+            return
+        await delete_character(self.char_id)
+        await interaction.response.send_message(f"💀 **{ch['name']}** eliminado.")
+        await check_combat_end(self.combat_id, interaction.channel)
+        self.stop()
+
+class MesaView(discord.ui.View):
+    def __init__(self, char_id: int, profession: str):
+        super().__init__(timeout=120)
+        self.char_id = char_id
+        self.profession = profession
+
+    @discord.ui.button(label="Craftear", style=discord.ButtonStyle.primary, emoji="🛠️")
+    async def craftear(self, interaction: discord.Interaction, button: discord.ui.Button):
+        ch = await get_character(self.char_id)
+        if not ch or ch["user_id"] != interaction.user.id:
+            await interaction.response.send_message("No es tu PJ.", ephemeral=True)
+            return
+        recipes = await get_recipes(interaction.guild_id, self.profession)
+        rank = rank_from_level(ch["level"])
+        max_grade = GRADE_ORDER.get(GRADE_BY_RANK.get(rank, "Comun"), 0)
+        available = [r for r in recipes if GRADE_ORDER.get(r[3], 0) <= max_grade]
+        if not available:
+            await interaction.response.send_message("No hay recetas disponibles para tu grado.", ephemeral=True)
+            return
+        lines = []
+        for r in available[:20]:
+            mats = json.loads(r[7] or "{}")
+            mat_txt = ", ".join(f"{k}x{v}" for k, v in mats.items())
+            magic = f" | Magia: {r[9]}" if r[8] else ""
+            lines.append(f"**ID {r[0]}** — {r[1]} [{r[3]}] → {r[4]} ({mat_txt}){magic}")
+        await interaction.response.send_message(
+            "🛠️ Recetas (usa `!craft <id_receta> <nombre_opcional>`):\n" + "\n".join(lines),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Reparar", style=discord.ButtonStyle.secondary, emoji="🔧")
+    async def reparar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.profession != "Herrero":
+            await interaction.response.send_message("Solo herreros reparan armas/armaduras.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "🔧 Escribe: `!reparar-arma <nombre_arma>`\n"
+            "Necesitas la mitad de materiales de la receta original y el grado adecuado.",
+            ephemeral=True,
+        )
+
+# ==================== BOT EVENTS ====================
 @bot.event
 async def on_ready():
     await init_db()
-    if not check_scheduled.is_running():
-        check_scheduled.start()
     try:
         synced = await tree.sync()
-        print(f"✅ Bot conectado como {bot.user}")
-        print(f"✅ Sincronizados {len(synced)} comandos")
+        print(f"✅ Conectado como {bot.user} | {len(synced)} comandos")
     except Exception as e:
-        print(f"Error: {e}")
-
-@tasks.loop(seconds=30)
-async def check_scheduled():
-    now = datetime.now(timezone.utc)
-    pending = await get_pending_scheduled()
-    for msg_id, guild_id, channel_id, content, embed_data, send_at in pending:
-        try:
-            send_time = datetime.fromisoformat(send_at)
-            if send_time.tzinfo is None:
-                send_time = send_time.replace(tzinfo=timezone.utc)
-            if now >= send_time:
-                guild = bot.get_guild(guild_id)
-                if guild:
-                    channel = guild.get_channel(channel_id)
-                    if channel:
-                        await channel.send(content)
-                await mark_scheduled_sent(msg_id)
-        except Exception as e:
-            print(f"Error programado {msg_id}: {e}")
+        print("Error sync:", e)
 
 @bot.event
-async def on_message(message):
+async def on_message(message: discord.Message):
     if not message.guild or not message.content:
         return
-
-    # Evita bucles infinitos: NUNCA procesar mensajes del propio bot
+    # Nunca procesar mensajes del propio bot (evita bucles de dados)
     if bot.user and message.author.id == bot.user.id:
         return
 
@@ -594,9 +818,8 @@ async def on_message(message):
     content_lower = content.lower()
     clean = content.replace(" ", "")
 
-    # CALCULADORA (Tupperbox sí, nuestro bot no)
-    math_pattern = r"^[\d\s\+\-\*\/\×\÷\^\(\)\.\%]+$"
-    if re.match(math_pattern, clean) and any(op in content for op in "+-*/×÷^%"):
+    # Calculadora
+    if re.match(r"^[\d\s\+\-\*\/\×\÷\^\(\)\.\%]+$", clean) and any(op in content for op in "+-*/×÷^%"):
         result = safe_eval(content)
         if result is not None:
             if isinstance(result, float) and result.is_integer():
@@ -604,7 +827,7 @@ async def on_message(message):
             await message.reply(f"**{content} = {result}**", mention_author=False)
             return
 
-    # DADOS: un solo mensaje. Solo si el mensaje ES el dado (evita re-disparos)
+    # Dados: SOLO si el mensaje entero es NdM
     dice_match = re.fullmatch(r"(\d{1,3})d(\d{1,5})", content_lower.replace(" ", ""))
     if dice_match:
         num_dice = int(dice_match.group(1))
@@ -615,729 +838,1394 @@ async def on_message(message):
             if num_dice == 1:
                 text = f"🎲 **{num_dice}d{sides}** = **{results[0]}**"
             else:
-                details = ", ".join(str(n) for n in results)
-                text = f"🎲 **{num_dice}d{sides}** → {details}\n**Total: {total}**"
+                text = f"🎲 **{num_dice}d{sides}** → {', '.join(map(str, results))}\n**Total: {total}**"
             await message.reply(text, mention_author=False)
             return
 
-    # ELIGE
+    # Elige
     if content_lower.startswith("elige:"):
-        options = [opt.strip() for opt in content[6:].split(",") if opt.strip()]
+        options = [o.strip() for o in content[6:].split(",") if o.strip()]
         if len(options) >= 2:
-            chosen = random.choice(options)
-            await message.reply(f"🎯 **He elegido:** {chosen}", mention_author=False)
+            await message.reply(f"🎯 **He elegido:** {random.choice(options)}", mention_author=False)
             return
 
-    # MENSAJES AUTOMÁTICOS (no responder a nuestro bot)
-    for auto in await get_auto_messages(message.guild.id):
-        if auto["trigger"] and auto["trigger"] in content_lower:
-            if auto["channels"] and message.channel.id not in auto["channels"]:
-                continue
-            if auto["responses"]:
-                await message.channel.send(random.choice(auto["responses"]))
+    # Prefijo combate / crafteo rápido
+    if not message.author.bot:
+        await handle_prefix_commands(message)
+
+    # XP por mensaje (si hay canal configurado y es ese canal)
+    if not message.author.bot:
+        cfg = await get_guild_config(message.guild.id)
+        if cfg["xp_channel_id"] and message.channel.id == cfg["xp_channel_id"]:
+            chars = await get_user_characters(message.guild.id, message.author.id)
+            if chars:
+                # XP al primer PJ por defecto
+                await grant_xp(chars[0][0], random.randint(5, 15), message.channel)
+
+async def grant_xp(char_id: int, amount: int, channel=None):
+    ch = await get_character(char_id)
+    if not ch:
+        return
+    cfg = await get_guild_config(ch["guild_id"])
+    max_level = cfg.get("max_level") or 50
+    new_xp = ch["xp"] + amount
+    new_level = min(calculate_level(new_xp), max_level)
+    old_level = ch["level"]
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute(
+            "UPDATE characters SET xp=?, level=? WHERE id=?",
+            (new_xp, new_level, char_id),
+        )
+        await db.commit()
+    if new_level > old_level and channel:
+        rewards = await get_level_reward(ch["guild_id"], new_level)
+        # Aplicar stats de nivel
+        if rewards and rewards[1]:
+            stats = json.loads(ch["stats_json"] or "{}")
+            bonus = json.loads(rewards[1] or "{}")
+            stats.update(bonus)
+            async with aiosqlite.connect(DATABASE) as db:
+                await db.execute(
+                    "UPDATE characters SET stats_json=? WHERE id=?",
+                    (json.dumps(stats), char_id),
+                )
+                await db.commit()
+        text = f"🎉 **{ch['name']}** subió al nivel **{new_level}**!"
+        if rewards and rewards[0]:
+            rw = json.loads(rewards[0] or "[]")
+            if rw:
+                text += "\nDesbloqueos:\n" + "\n".join(f"• {x}" for x in rw)
+        if new_level == PROFESSION_LEVEL:
+            text += "\n🛠️ ¡Puedes elegir profesión con `/profesion`!"
+        await channel.send(text)
+
+async def get_level_reward(guild_id: int, level: int):
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute(
+            "SELECT rewards, stats_json FROM level_rewards WHERE guild_id=? AND level=?",
+            (guild_id, level),
+        ) as cur:
+            return await cur.fetchone()
+
+async def handle_prefix_commands(message: discord.Message):
+    content = message.content.strip()
+    if content.startswith("!craft "):
+        parts = content[7:].strip().split(maxsplit=1)
+        if not parts:
+            return
+        try:
+            rid = int(parts[0])
+        except ValueError:
+            await message.reply("ID de receta inválido.")
+            return
+        custom_name = parts[1] if len(parts) > 1 else None
+        await do_craft(message, rid, custom_name)
+    elif content.startswith("!reparar-arma "):
+        arma = content[14:].strip()
+        await do_repair(message, arma)
+    elif content.startswith("!ataque "):
+        await do_attack(message)
+    elif content.startswith("!defensa "):
+        await do_defend(message)
+    elif content.startswith("!esquivar"):
+        await do_dodge(message)
+    elif content.startswith("!usar-combate "):
+        await do_combat_use(message)
+
+async def do_craft(message, recipe_id: int, custom_name: str = None):
+    chars = await get_user_characters(message.guild.id, message.author.id)
+    if not chars:
+        await message.reply("No tienes personajes.")
+        return
+    # Usar primer PJ con profesión compatible; mejor: buscar quién tiene la mesa
+    recipe = await get_recipe(recipe_id)
+    if not recipe:
+        await message.reply("Receta no existe.")
+        return
+    char = None
+    for cid, name, level, cls, prof in chars:
+        if prof == recipe[2]:
+            char = await get_character(cid)
             break
-
-    # XP solo usuarios reales
-    if message.author.bot:
+    if not char:
+        await message.reply(f"Ninguno de tus PJs es **{recipe[2]}**.")
         return
-
-    user_class = await get_user_class(message.guild.id, message.author.id)
-    if not user_class:
+    rank = rank_from_level(char["level"])
+    if GRADE_ORDER.get(recipe[3], 0) > GRADE_ORDER.get(GRADE_BY_RANK.get(rank, "Comun"), 0):
+        await message.reply("Tu rango no alcanza para ese grado.")
         return
-
-    key = f"{message.guild.id}:{message.author.id}"
-    now = datetime.now(timezone.utc).timestamp()
-    if key in cooldowns and now - cooldowns[key] < XP_COOLDOWN:
-        return
-    if await is_channel_ignored(message.guild.id, message.channel.id):
-        return
-
-    config = await get_guild_config(message.guild.id)
-    data = await get_user_data(message.guild.id, message.author.id)
-    if config.get("max_level", 0) > 0 and data["level"] >= config["max_level"]:
-        return
-
-    xp_gain = random.randint(XP_MIN, XP_MAX)
-    new_xp, new_level, leveled_up = await add_xp(message.guild.id, message.author.id, xp_gain)
-    cooldowns[key] = now
-    if leveled_up:
-        await send_levelup_message(message.guild, message.author, new_level, user_class)
-
-async def send_levelup_message(guild, member, level, class_name):
-    config = await get_guild_config(guild.id)
-    channel_id = config["levelup_channel_id"]
-    if not channel_id:
-        return
-    channel = guild.get_channel(channel_id)
-    if not channel:
-        return
-    rewards = await get_rewards(guild.id, class_name, level)
-    embed = discord.Embed(
-        title="🎉 ¡Subiste de Nivel!",
-        description=f"¡Felicidades {member.mention}!\n\nHas alcanzado el **Nivel {level}** 🚀\n**Clase:** {class_name}",
-        color=discord.Color.gold(),
-        timestamp=datetime.now(timezone.utc)
-    )
-    embed.set_thumbnail(url=member.display_avatar.url)
-    if rewards:
-        embed.add_field(
-            name=f"🎁 Has desbloqueado en el nivel {level}:",
-            value="\n".join(f"• {r}" for r in rewards),
-            inline=False
-        )
-    embed.set_footer(text="Level Up • Creado por 《JEFP25》")
-    try:
-        await channel.send(content=member.mention, embed=embed)
-    except Exception:
-        pass
-
-# ==================== USUARIO ====================
-@tree.command(name="rank", description="Muestra tu nivel y XP")
-async def rank(interaction: discord.Interaction, usuario: discord.Member = None):
-    target = usuario or interaction.user
-    data = await get_user_data(interaction.guild_id, target.id)
-    user_class = await get_user_class(interaction.guild_id, target.id)
-    current_level, current_xp = data["level"], data["xp"]
-    next_level_xp = xp_for_level(current_level + 1)
-    xp_needed = max(0, next_level_xp - current_xp)
-    prev_xp = xp_for_level(current_level)
-    progress = 0
-    if next_level_xp > prev_xp:
-        progress = max(0, min(1, (current_xp - prev_xp) / (next_level_xp - prev_xp)))
-    bar = "█" * int(12 * progress) + "░" * (12 - int(12 * progress))
-    embed = discord.Embed(title=f"📊 Rank de {target.display_name}", color=discord.Color.blurple())
-    embed.set_thumbnail(url=target.display_avatar.url)
-    embed.add_field(name="Nivel", value=f"**{current_level}**", inline=True)
-    embed.add_field(name="XP Total", value=f"**{current_xp:,}**", inline=True)
-    embed.add_field(name="Siguiente nivel", value=f"**{xp_needed:,}** XP", inline=True)
-    embed.add_field(name="Clase", value=user_class or "❌ Sin clase", inline=True)
-    embed.add_field(name="Dinero", value=f"**{await get_money(interaction.guild_id, target.id):,}**", inline=True)
-    embed.add_field(name="Progreso", value=f"`{bar}` {int(progress*100)}%", inline=False)
-    embed.set_footer(text="Creado por 《JEFP25》")
-    await interaction.response.send_message(embed=embed)
-
-@tree.command(name="leaderboard", description="Top 10 de XP del servidor")
-async def leaderboard(interaction: discord.Interaction):
-    async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute(
-            "SELECT user_id, xp, level FROM users WHERE guild_id=? ORDER BY xp DESC LIMIT 10",
-            (interaction.guild_id,)
-        ) as cur:
-            rows = await cur.fetchall()
-    if not rows:
-        await interaction.response.send_message("Aún no hay datos.", ephemeral=True)
-        return
-    description = ""
-    medals = ["🥇", "🥈", "🥉"]
-    for i, (user_id, xp, level) in enumerate(rows):
-        medal = medals[i] if i < 3 else f"**{i+1}.**"
-        member = interaction.guild.get_member(user_id)
-        name = member.display_name if member else f"Usuario {user_id}"
-        user_class = await get_user_class(interaction.guild_id, user_id)
-        extra = f" ({user_class})" if user_class else ""
-        description += f"{medal} {name}{extra} — Nivel **{level}** ({xp:,} XP)\n"
-    embed = discord.Embed(title="🏆 Leaderboard XP", description=description, color=discord.Color.gold())
-    embed.set_footer(text="Creado por 《JEFP25》")
-    await interaction.response.send_message(embed=embed)
-
-@tree.command(name="elegir-clase", description="Elige tu clase (solo una vez)")
-async def elegir_clase(interaction: discord.Interaction, clase: str):
-    if await get_user_class(interaction.guild_id, interaction.user.id):
-        await interaction.response.send_message("❌ Ya tienes clase.", ephemeral=True)
-        return
-    if not await class_exists(interaction.guild_id, clase):
-        clases = await get_classes(interaction.guild_id)
-        await interaction.response.send_message(
-            f"❌ No existe. Disponibles: {', '.join(clases) or 'Ninguna'}",
-            ephemeral=True
-        )
-        return
-    await set_user_class(interaction.guild_id, interaction.user.id, clase)
-    await interaction.response.send_message(f"✅ Has elegido la clase **{clase}**.")
-
-@tree.command(name="mi-clase", description="Muestra tu clase actual")
-async def mi_clase(interaction: discord.Interaction):
-    user_class = await get_user_class(interaction.guild_id, interaction.user.id)
-    if user_class:
-        await interaction.response.send_message(f"🛡️ Tu clase es: **{user_class}**")
-    else:
-        await interaction.response.send_message("❌ No tienes clase. Usa `/elegir-clase`.")
-
-@tree.command(name="ver-lista", description="Ver recompensas de una clase")
-async def ver_lista(interaction: discord.Interaction, clase: str = None):
-    if not clase:
-        clase = await get_user_class(interaction.guild_id, interaction.user.id)
-        if not clase:
-            await interaction.response.send_message("❌ Indica una clase.", ephemeral=True)
+    mats = json.loads(recipe[7] or "{}")
+    if recipe[8] and recipe[9]:
+        mats[recipe[9]] = mats.get(recipe[9], 0) + 1
+    for mat, need in mats.items():
+        it = await get_item(char["id"], mat)
+        if not it or it[1] < need:
+            await message.reply(f"Te falta material: **{mat}** (necesitas {need}).")
             return
-    if not await class_exists(interaction.guild_id, clase):
-        await interaction.response.send_message("❌ Esa clase no existe.", ephemeral=True)
+    for mat, need in mats.items():
+        await add_item(char["id"], mat, -need)
+    result_data = json.loads(recipe[6] or "{}")
+    result_data["GRADO"] = recipe[3]
+    result_data["RECETA_ID"] = recipe[0]
+    result_data["MATERIALS"] = json.loads(recipe[7] or "{}")
+    item_name = custom_name or recipe[4]
+    await add_item(
+        char["id"], item_name, 1, recipe[5], result_data,
+        recipe[10] or "", f"Creado por {char['name']}"
+    )
+    await message.reply(f"✅ **{char['name']}** crafteó **{item_name}** [{recipe[3]}].")
+
+async def do_repair(message, arma_name: str):
+    chars = await get_user_characters(message.guild.id, message.author.id)
+    herrero = None
+    for cid, name, level, cls, prof in chars:
+        if prof == "Herrero":
+            herrero = await get_character(cid)
+            break
+    if not herrero:
+        await message.reply("Ningún PJ tuyo es Herrero.")
         return
-    rewards = await get_all_rewards(interaction.guild_id, clase)
-    if not rewards:
-        await interaction.response.send_message(f"La clase **{clase}** no tiene recompensas.")
+    # Buscar arma en inventarios del usuario
+    target_char = None
+    item = None
+    for cid, *_ in chars:
+        it = await get_item(cid, arma_name)
+        if it:
+            target_char = await get_character(cid)
+            item = it
+            break
+    if not item:
+        await message.reply("No tienes esa arma.")
         return
-    description = "".join(
-        f"**Nivel {lv}:**\n" + "\n".join(f"  • {r}" for r in rw) + "\n\n"
-        for lv, rw in sorted(rewards.items())
-    )
-    embed = discord.Embed(title=f"📜 Recompensas de {clase}", description=description, color=discord.Color.purple())
-    embed.set_footer(text="Creado por 《JEFP25》")
-    await interaction.response.send_message(embed=embed)
-
-@tree.command(name="help", description="Lista de todos los comandos")
-async def help_command(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="📖 Level Up - Comandos",
-        description="Bot de niveles, economía, tiendas e inventario.",
-        color=discord.Color.blue()
-    )
-    embed.add_field(
-        name="👤 Usuario",
-        value=(
-            "`/rank` Nivel, XP, clase y dinero\n"
-            "`/leaderboard` Top 10 de XP\n"
-            "`/elegir-clase` Elegir clase (una vez)\n"
-            "`/mi-clase` Ver tu clase\n"
-            "`/ver-lista` Recompensas de una clase\n"
-            "`/help` Esta lista"
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="💰 Economía e inventario",
-        value=(
-            "`/dinero` Ver tu dinero o el de otro\n"
-            "`/top-dinero` Ranking de dinero\n"
-            "`/inventario` Ver inventario\n"
-            "`/pagar` Dar dinero a otro jugador\n"
-            "`/dar-item` Dar un ítem de tu inventario\n"
-            "`/tiendas` Lista de tiendas\n"
-            "`/ver-tienda` Ver ítems de una tienda\n"
-            "`/comprar` Comprar un ítem"
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="🎲 Utilidades (escríbelo en el chat)",
-        value="`1d20` `5d60` `Elige: sí, no, tal vez`\n`1+2` `10*5` `10%*30`",
-        inline=False
-    )
-    embed.add_field(
-        name="🛡️ Admin - XP y clases",
-        value=(
-            "`/dar-xp` `/quitar-xp` `/ver-xp` `/dar-xp-rol` `/quitar-xp-rol`\n"
-            "`/resetear-xp` `/resetear-xp-rol`\n"
-            "`/añadir-clase` `/borrar-clase` `/añadir-recompensa` `/borrar-recompensa`\n"
-            "`/resetear-clase` `/set-nivel-maximo`"
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="🛡️ Admin - Economía y tiendas",
-        value=(
-            "`/dar-dinero` `/quitar-dinero`\n"
-            "`/crear-tienda` `/borrar-tienda`\n"
-            "`/item-tienda` `/quitar-item-tienda`"
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="🛡️ Admin - Mensajes",
-        value="`/embed` `/programar-mensaje` `/auto-mensaje` `/auto-lista` `/auto-borrar`",
-        inline=False
-    )
-    embed.add_field(
-        name="⚙️ Config",
-        value=(
-            "`/config-canal-levelup` `/config-desactivar-levelup`\n"
-            "`/config-ignorar-canal` `/config-permitir-canal` `/config-canales-ignorados`\n"
-            "`/config-roles-admin` `/config-ver`"
-        ),
-        inline=False
-    )
-    embed.set_footer(text="Creado por 《JEFP25》")
-    await interaction.response.send_message(embed=embed)
-
-# ==================== ECONOMÍA USUARIO ====================
-@tree.command(name="dinero", description="Muestra tu dinero o el de otro usuario")
-async def dinero(interaction: discord.Interaction, usuario: discord.Member = None):
-    target = usuario or interaction.user
-    amount = await get_money(interaction.guild_id, target.id)
-    await interaction.response.send_message(f"💰 {target.mention} tiene **{amount:,}** monedas.")
-
-@tree.command(name="top-dinero", description="Top 10 de dinero del servidor")
-async def top_dinero(interaction: discord.Interaction):
+    data = json.loads(item[3] or "{}")
+    grade = data.get("GRADO", "Comun")
+    rank = rank_from_level(herrero["level"])
+    if GRADE_ORDER.get(grade, 0) > GRADE_ORDER.get(GRADE_BY_RANK.get(rank, "Comun"), 0):
+        await message.reply(f"Necesitas rango mayor para reparar armas **{grade}**.")
+        return
+    mats = data.get("MATERIALS") or {}
+    half = {k: max(1, v // 2) for k, v in mats.items()} if mats else {}
+    if not half:
+        await message.reply("Esta arma no tiene materiales de receta guardados; admin puede reparar con `/reparar`.")
+        return
+    for mat, need in half.items():
+        it = await get_item(herrero["id"], mat)
+        if not it or it[1] < need:
+            await message.reply(f"Falta material para reparar: **{mat}** x{need}")
+            return
+    for mat, need in half.items():
+        await add_item(herrero["id"], mat, -need)
+    # Restaurar durabilidad máxima si existe
+    if "DUR_MAX" in data:
+        data["DUR"] = data["DUR_MAX"]
+    elif "DUR" in data:
+        data["DUR"] = max(data.get("DUR", 1), data.get("DUR", 1))
     async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute(
-            "SELECT user_id, money FROM economy WHERE guild_id=? ORDER BY money DESC LIMIT 10",
-            (interaction.guild_id,)
-        ) as cur:
-            rows = await cur.fetchall()
-    if not rows:
-        await interaction.response.send_message("Aún no hay economía en el servidor.")
+        await db.execute(
+            "UPDATE inventory SET data_json=? WHERE character_id=? AND item_name=?",
+            (json.dumps(data), target_char["id"], arma_name),
+        )
+        await db.commit()
+    await message.reply(f"🔧 **{arma_name}** reparada por **{herrero['name']}**.")
+
+async def do_attack(message):
+    # !ataque <obj_id> <arma> | descripcion
+    body = message.content[8:].strip()
+    if "|" not in body:
+        await message.reply("Formato: `!ataque <id_objetivo> <arma> | descripción`")
         return
-    description = ""
-    medals = ["🥇", "🥈", "🥉"]
-    for i, (user_id, money) in enumerate(rows):
-        medal = medals[i] if i < 3 else f"**{i+1}.**"
-        member = interaction.guild.get_member(user_id)
-        name = member.display_name if member else f"Usuario {user_id}"
-        description += f"{medal} {name} — **{money:,}** monedas\n"
-    embed = discord.Embed(title="💰 Top Economía", description=description, color=discord.Color.gold())
+    left, desc = body.split("|", 1)
+    left_parts = left.strip().split(maxsplit=1)
+    if len(left_parts) < 2:
+        await message.reply("Indica objetivo y arma.")
+        return
+    try:
+        target_id = int(left_parts[0])
+    except ValueError:
+        await message.reply("ID de objetivo inválido.")
+        return
+    arma = left_parts[1].strip()
+    desc = desc.strip()
+    chars = await get_user_characters(message.guild.id, message.author.id)
+    actor_ch = None
+    combat_id = None
+    for cid, *_ in chars:
+        cid_combat = await get_active_combat_for_char(cid)
+        if cid_combat:
+            actor_ch = await get_character(cid)
+            combat_id = cid_combat
+            break
+    if not actor_ch or not combat_id:
+        await message.reply("No estás en combate activo.")
+        return
+    combat = await get_combat(combat_id)
+    parts = await get_participants(combat_id)
+    actor_p = next((p for p in parts if p["character_id"] == actor_ch["id"]), None)
+    target_p = next((p for p in parts if p["character_id"] == target_id and p["alive"]), None)
+    if not actor_p or not actor_p["alive"]:
+        await message.reply("Tu PJ no está activo en este combate.")
+        return
+    # Verificar turno
+    view = CombatView(combat_id)
+    _, current = await view._current_actor()
+    if not current or current["character_id"] != actor_ch["id"]:
+        await message.reply("No es tu turno.")
+        return
+    if not target_p:
+        await message.reply("Objetivo inválido.")
+        return
+    item = await get_item(actor_ch["id"], arma)
+    if not item:
+        await message.reply("No tienes esa arma.")
+        return
+    data = json.loads(item[3] or "{}")
+    dmg = int(data.get("DAÑO") or data.get("PODER") or 1)
+    mana_cost = int(data.get("MANA_COST") or 0)
+    if mana_cost and actor_p["mana"] < mana_cost:
+        await message.reply("No tienes maná suficiente.")
+        return
+    if mana_cost:
+        await update_participant(combat_id, actor_ch["id"], mana=actor_p["mana"] - mana_cost)
+
+    actor_stats = json.loads(actor_p["stats_json"] or "{}")
+    target_stats = json.loads(target_p["stats_json"] or "{}")
+    # ¿Está defendiendo alguien a este objetivo?
+    defender = next(
+        (p for p in parts if p["alive"] and p.get("defending_target") == target_id),
+        None,
+    )
+    applied_to = target_p
+    note = ""
+    if defender:
+        applied_to = defender
+        note = " (interceptado por tanque)"
+        def_ch = await get_character(defender["character_id"])
+        # daño a arma del defensor si tiene pending defense weapon en stats temp — simplificado a vida
+        new_hp = max(0, applied_to["vida"] - dmg)
+        await update_participant(combat_id, applied_to["character_id"], vida=new_hp, alive=1 if new_hp > 0 else 0)
+        await append_log(combat_id, f"⚔️ {actor_ch['name']} ataca a {target_id} con {arma}: {dmg} dmg{note}. {desc}")
+        await message.channel.send(
+            f"⚔️ **{actor_ch['name']}** ataca con **{arma}** → {dmg} daño{note}\n_{desc}_"
+        )
+        if new_hp <= 0:
+            await handle_downed(combat_id, applied_to, message.channel)
+        else:
+            await advance_turn(combat_id, message.channel)
+        return
+
+    # Esquiva se resolvió en turno previo si marcó dodge — simplificado: comparar VEL si target marcó esquivar en data
+    # Impacto directo
+    efecto = data.get("EFECTO")
+    new_hp = max(0, target_p["vida"] - dmg)
+    effects = json.loads(target_p["effects_json"] or "[]")
+    if efecto and new_hp > 0 and efecto in EFFECTS:
+        if len(effects) < 2:
+            effects.append({"name": efecto, "turns": int(data.get("EFECTO_TURNOS") or 2)})
+    await update_participant(
+        combat_id, target_id,
+        vida=new_hp,
+        alive=1 if new_hp > 0 else 0,
+        effects_json=json.dumps(effects),
+    )
+    tch = await get_character(target_id)
+    await append_log(combat_id, f"⚔️ {actor_ch['name']} → {tch['name'] if tch else target_id} con {arma}: {dmg} dmg. {desc}")
+    await message.channel.send(
+        f"⚔️ **{actor_ch['name']}** ataca a **{tch['name'] if tch else target_id}** con **{arma}**\n"
+        f"Daño: **{dmg}** | Vida restante: **{new_hp}**\n_{desc}_"
+    )
+    if new_hp <= 0:
+        await handle_downed(combat_id, target_p, message.channel)
+    else:
+        await advance_turn(combat_id, message.channel)
+
+async def do_defend(message):
+    body = message.content[9:].strip()
+    if "|" not in body:
+        await message.reply("Formato: `!defensa <arma> | descripción` o `!defensa <id_aliado> <arma> | desc`")
+        return
+    left, desc = body.split("|", 1)
+    parts_l = left.strip().split()
+    chars = await get_user_characters(message.guild.id, message.author.id)
+    actor_ch = None
+    combat_id = None
+    for cid, *_ in chars:
+        c = await get_active_combat_for_char(cid)
+        if c:
+            actor_ch = await get_character(cid)
+            combat_id = c
+            break
+    if not actor_ch:
+        await message.reply("No estás en combate.")
+        return
+    view = CombatView(combat_id)
+    _, current = await view._current_actor()
+    if not current or current["character_id"] != actor_ch["id"]:
+        await message.reply("No es tu turno.")
+        return
+    protect_id = actor_ch["id"]
+    arma = left.strip()
+    if parts_l and parts_l[0].isdigit():
+        protect_id = int(parts_l[0])
+        arma = " ".join(parts_l[1:]) if len(parts_l) > 1 else ""
+    await update_participant(combat_id, actor_ch["id"], defending_target=protect_id)
+    await append_log(combat_id, f"🛡️ {actor_ch['name']} defiende a {protect_id} con {arma}. {desc.strip()}")
+    await message.channel.send(f"🛡️ **{actor_ch['name']}** se prepara para defender.\n_{desc.strip()}_")
+    await advance_turn(combat_id, message.channel)
+
+async def do_dodge(message):
+    desc = ""
+    if "|" in message.content:
+        desc = message.content.split("|", 1)[1].strip()
+    chars = await get_user_characters(message.guild.id, message.author.id)
+    actor_ch = None
+    combat_id = None
+    for cid, *_ in chars:
+        c = await get_active_combat_for_char(cid)
+        if c:
+            actor_ch = await get_character(cid)
+            combat_id = c
+            break
+    if not actor_ch:
+        await message.reply("No estás en combate.")
+        return
+    view = CombatView(combat_id)
+    _, current = await view._current_actor()
+    if not current or current["character_id"] != actor_ch["id"]:
+        await message.reply("No es tu turno.")
+        return
+    # Marcar alta velocidad temporal como intención de esquivar: guardamos flag en effects
+    effects = json.loads(current["effects_json"] or "[]")
+    effects = [e for e in effects if e.get("name") != "ESQUIVANDO"]
+    effects.append({"name": "ESQUIVANDO", "turns": 1})
+    await update_participant(combat_id, actor_ch["id"], effects_json=json.dumps(effects))
+    await append_log(combat_id, f"💨 {actor_ch['name']} intenta esquivar. {desc}")
+    await message.channel.send(f"💨 **{actor_ch['name']}** se prepara para esquivar.\n_{desc}_")
+    await advance_turn(combat_id, message.channel)
+
+async def do_combat_use(message):
+    body = message.content[14:].strip()
+    if "|" not in body:
+        await message.reply("Formato: `!usar-combate <item> | descripción`")
+        return
+    item_name, desc = body.split("|", 1)
+    item_name = item_name.strip()
+    desc = desc.strip()
+    chars = await get_user_characters(message.guild.id, message.author.id)
+    actor_ch = None
+    combat_id = None
+    for cid, *_ in chars:
+        c = await get_active_combat_for_char(cid)
+        if c:
+            actor_ch = await get_character(cid)
+            combat_id = c
+            break
+    if not actor_ch:
+        await message.reply("No estás en combate.")
+        return
+    view = CombatView(combat_id)
+    _, current = await view._current_actor()
+    if not current or current["character_id"] != actor_ch["id"]:
+        await message.reply("No es tu turno.")
+        return
+    item = await get_item(actor_ch["id"], item_name)
+    if not item:
+        await message.reply("No tienes ese ítem.")
+        return
+    data = json.loads(item[3] or "{}")
+    item_type = item[2]
+    # Canciones y mesas no se gastan; pociones sí
+    consumible = item_type.lower() in ("poción", "pocion", "elixir", "veneno", "comida")
+    if data.get("REVIVIR"):
+        consumible = True
+    if consumible:
+        await add_item(actor_ch["id"], item_name, -1)
+    # Efecto simple de curación si tiene $VIDA en data como heal
+    heal = int(data.get("CURA") or 0)
+    if heal:
+        new_hp = current["vida"] + heal
+        await update_participant(combat_id, actor_ch["id"], vida=new_hp)
+    await append_log(combat_id, f"🎒 {actor_ch['name']} usa {item_name}. {desc}")
+    await message.channel.send(f"🎒 **{actor_ch['name']}** usa **{item_name}**\n_{desc}_")
+    await advance_turn(combat_id, message.channel)
+
+# ==================== COMANDOS SLASH ====================
+@tree.command(name="help", description="Lista de comandos del bot RPG")
+async def help_cmd(interaction: discord.Interaction):
+    embed = discord.Embed(title="📖 Comandos RPG", color=discord.Color.blurple())
+    embed.add_field(
+        name="👤 Personajes",
+        value="`/crear` `/borrar-pj` `/pjs` `/perfil` `/editar-pj` `/profesion`",
+        inline=False,
+    )
+    embed.add_field(
+        name="💰 Inventario",
+        value="`/dinero` `/inv` `/dar-item` `/dar-dinero` `/usar`",
+        inline=False,
+    )
+    embed.add_field(
+        name="🛒 Tienda",
+        value="`/tiendas` `/ver-tienda` `/comprar`",
+        inline=False,
+    )
+    embed.add_field(
+        name="🛠️ Crafteo",
+        value="`/recetas` — Usa la **mesa** del inventario con `/usar`",
+        inline=False,
+    )
+    embed.add_field(
+        name="⚔️ Combate",
+        value="`/duelo` `/combate` `/log`\nBotones: Atacar, Defender, Esquivar, Inventario, Huir",
+        inline=False,
+    )
+    embed.add_field(
+        name="🎲 Utilidades",
+        value="`1d20` · `Elige: a, b` · `1+2` · `/embed`",
+        inline=False,
+    )
+    embed.add_field(
+        name="🛡️ Admin",
+        value="`/crear-clase` `/crear-profesion` `/crear-tienda` `/item-tienda` `/crear-material` `/crear-receta` `/craftear` `/reparar` `/dar-xp` `/quitar-xp` `/dar-dinero` `/quitar-dinero` `/config-nivel` `/reward-nivel` `/canal-xp` `/roles-admin` `/fin-combate`",
+        inline=False,
+    )
     embed.set_footer(text="Creado por 《JEFP25》")
     await interaction.response.send_message(embed=embed)
 
-@tree.command(name="inventario", description="Muestra tu inventario o el de otro usuario")
-async def inventario(interaction: discord.Interaction, usuario: discord.Member = None):
-    target = usuario or interaction.user
-    items = await get_inventory(interaction.guild_id, target.id)
-    if not items:
-        await interaction.response.send_message(f"🎒 El inventario de {target.mention} está vacío.")
+@tree.command(name="crear", description="Crea un personaje (máx. 3)")
+@app_commands.describe(
+    nombre="Nombre del personaje",
+    clase="Clase del personaje",
+    descripcion="Descripción / historia",
+    imagen="URL de imagen",
+    color="Color hex sin # (ej: FF5500)",
+)
+@app_commands.autocomplete(clase=ac_classes)
+async def crear_pj(
+    interaction: discord.Interaction,
+    nombre: str,
+    clase: str,
+    descripcion: str = "",
+    imagen: str = "",
+    color: str = "5865F2",
+):
+    if await count_characters(interaction.guild_id, interaction.user.id) >= MAX_PJ:
+        await interaction.response.send_message("❌ Ya tienes 3 personajes. Borra uno primero.", ephemeral=True)
         return
-    text = "\n".join(f"• **{name}** ×{qty}" for name, qty in items)
+    cls = await get_class(interaction.guild_id, clase)
+    if not cls:
+        await interaction.response.send_message("❌ Esa clase no existe. Un admin debe crearla.", ephemeral=True)
+        return
+    stats = dict(DEFAULT_STATS)
+    stats.update(parse_codes(cls[1] or ""))
+    stats.update(json.loads(cls[2] or "{}"))
+    stats["VIDA"] = stats.get("VIDA_MAX", stats.get("VIDA", 20))
+    stats["MANA"] = stats.get("MANA_MAX", stats.get("MANA", 10))
+    try:
+        color_val = int(color.replace("#", ""), 16)
+    except Exception:
+        color_val = 0x5865F2
+    async with aiosqlite.connect(DATABASE) as db:
+        cur = await db.execute(
+            """INSERT INTO characters
+               (guild_id, user_id, name, description, image_url, color, class_name, stats_json)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                interaction.guild_id, interaction.user.id, nombre.strip(), descripcion,
+                imagen, color_val, clase, json.dumps(stats),
+            ),
+        )
+        await db.commit()
+        char_id = cur.lastrowid
     embed = discord.Embed(
-        title=f"🎒 Inventario de {target.display_name}",
-        description=text,
-        color=discord.Color.green()
+        title=f"✨ Personaje creado: {nombre}",
+        description=descripcion or "Sin descripción",
+        color=color_val,
     )
-    embed.set_footer(text="Creado por 《JEFP25》")
+    embed.add_field(name="Clase", value=clase, inline=True)
+    embed.add_field(name="Nivel", value="1", inline=True)
+    embed.add_field(
+        name="Stats",
+        value="\n".join(f"{k}: {v}" for k, v in stats.items() if k in DEFAULT_STATS),
+        inline=False,
+    )
+    if imagen:
+        embed.set_thumbnail(url=imagen)
+    embed.set_footer(text=f"ID: {char_id}")
     await interaction.response.send_message(embed=embed)
 
-@tree.command(name="pagar", description="Dale dinero a otro jugador")
-@app_commands.describe(usuario="A quién le das dinero", cantidad="Cantidad a dar")
-async def pagar(interaction: discord.Interaction, usuario: discord.Member, cantidad: app_commands.Range[int, 1, 100000000]):
-    if usuario.id == interaction.user.id:
-        await interaction.response.send_message("❌ No puedes pagarte a ti mismo.", ephemeral=True)
+@tree.command(name="borrar-pj", description="Borra uno de tus personajes")
+@app_commands.describe(pj="Personaje a borrar")
+@app_commands.autocomplete(pj=ac_user_chars)
+async def borrar_pj(interaction: discord.Interaction, pj: str):
+    try:
+        char_id = int(pj)
+    except ValueError:
+        await interaction.response.send_message("PJ inválido.", ephemeral=True)
         return
-    if usuario.bot:
-        await interaction.response.send_message("❌ No puedes pagarle a un bot.", ephemeral=True)
+    ch = await get_character(char_id)
+    if not ch or ch["user_id"] != interaction.user.id or ch["guild_id"] != interaction.guild_id:
+        await interaction.response.send_message("No es tu personaje.", ephemeral=True)
         return
-    current = await get_money(interaction.guild_id, interaction.user.id)
-    if current < cantidad:
-        await interaction.response.send_message(
-            f"❌ No tienes suficiente dinero. Tienes **{current:,}**.",
-            ephemeral=True
+    if await get_active_combat_for_char(char_id):
+        await interaction.response.send_message("No puedes borrar un PJ en combate.", ephemeral=True)
+        return
+    await delete_character(char_id)
+    await interaction.response.send_message(f"🗑️ Personaje **{ch['name']}** eliminado.")
+
+@tree.command(name="pjs", description="Lista tus personajes")
+async def pjs_cmd(interaction: discord.Interaction):
+    chars = await get_user_characters(interaction.guild_id, interaction.user.id)
+    if not chars:
+        await interaction.response.send_message("No tienes personajes. Usa `/crear`.")
+        return
+    lines = [
+        f"**{name}** — Nv.{level} | {cls or '—'} | {prof or 'Sin profesión'} (ID `{cid}`)"
+        for cid, name, level, cls, prof in chars
+    ]
+    embed = discord.Embed(
+        title=f"👥 Tus personajes ({len(chars)}/{MAX_PJ})",
+        description="\n".join(lines),
+        color=discord.Color.green(),
+    )
+    await interaction.response.send_message(embed=embed)
+
+@tree.command(name="perfil", description="Ver perfil de un personaje")
+@app_commands.describe(pj="Personaje")
+@app_commands.autocomplete(pj=ac_user_chars)
+async def perfil(interaction: discord.Interaction, pj: str):
+    try:
+        char_id = int(pj)
+    except ValueError:
+        await interaction.response.send_message("PJ inválido.", ephemeral=True)
+        return
+    ch = await get_character(char_id)
+    if not ch or ch["guild_id"] != interaction.guild_id:
+        await interaction.response.send_message("Personaje no encontrado.", ephemeral=True)
+        return
+    stats = json.loads(ch["stats_json"] or "{}")
+    embed = discord.Embed(
+        title=f"👤 {ch['name']}",
+        description=ch["description"] or "Sin descripción",
+        color=ch["color"] or 0x5865F2,
+    )
+    embed.add_field(name="Clase", value=ch["class_name"] or "—", inline=True)
+    embed.add_field(name="Profesión", value=ch["profession"] or "—", inline=True)
+    embed.add_field(name="Nivel", value=f"{ch['level']} ({rank_from_level(ch['level'])})", inline=True)
+    embed.add_field(name="XP", value=str(ch["xp"]), inline=True)
+    embed.add_field(name="💰 Dinero", value=f"{ch['money']:,}", inline=True)
+    embed.add_field(
+        name="Stats",
+        value="\n".join(
+            f"**{k}:** {stats.get(k, 0)}"
+            for k in ["VIDA", "VIDA_MAX", "FUE", "VEL", "RES", "DEF", "MANA", "MANA_MAX"]
+            if k in stats or True
+        ),
+        inline=False,
+    )
+    if ch["image_url"]:
+        embed.set_thumbnail(url=ch["image_url"])
+    embed.set_footer(text=f"ID {ch['id']} · Dueño: {ch['user_id']}")
+    await interaction.response.send_message(embed=embed)
+
+@tree.command(name="editar-pj", description="Edita nombre, descripción, imagen o color")
+@app_commands.describe(pj="Personaje", nombre="Nuevo nombre", descripcion="Nueva descripción", imagen="URL imagen", color="Hex color")
+@app_commands.autocomplete(pj=ac_user_chars)
+async def editar_pj(
+    interaction: discord.Interaction,
+    pj: str,
+    nombre: str = None,
+    descripcion: str = None,
+    imagen: str = None,
+    color: str = None,
+):
+    try:
+        char_id = int(pj)
+    except ValueError:
+        await interaction.response.send_message("PJ inválido.", ephemeral=True)
+        return
+    ch = await get_character(char_id)
+    if not ch or ch["user_id"] != interaction.user.id:
+        await interaction.response.send_message("No es tu personaje.", ephemeral=True)
+        return
+    fields = {}
+    if nombre:
+        fields["name"] = nombre.strip()
+    if descripcion is not None:
+        fields["description"] = descripcion
+    if imagen is not None:
+        fields["image_url"] = imagen
+    if color:
+        try:
+            fields["color"] = int(color.replace("#", ""), 16)
+        except Exception:
+            pass
+    if not fields:
+        await interaction.response.send_message("No indicaste cambios.", ephemeral=True)
+        return
+    sets = ", ".join(f"{k}=?" for k in fields)
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute(
+            f"UPDATE characters SET {sets} WHERE id=?",
+            (*fields.values(), char_id),
         )
+        await db.commit()
+    await interaction.response.send_message("✅ Personaje actualizado.")
+
+@tree.command(name="profesion", description="Elige profesión (nivel 10+)")
+@app_commands.describe(pj="Personaje", profesion="Profesión")
+@app_commands.autocomplete(pj=ac_user_chars, profesion=ac_professions)
+async def profesion_cmd(interaction: discord.Interaction, pj: str, profesion: str):
+    try:
+        char_id = int(pj)
+    except ValueError:
+        await interaction.response.send_message("PJ inválido.", ephemeral=True)
         return
-    await add_money(interaction.guild_id, interaction.user.id, -cantidad)
-    await add_money(interaction.guild_id, usuario.id, cantidad)
+    ch = await get_character(char_id)
+    if not ch or ch["user_id"] != interaction.user.id:
+        await interaction.response.send_message("No es tu personaje.", ephemeral=True)
+        return
+    if ch["level"] < PROFESSION_LEVEL:
+        await interaction.response.send_message(f"Necesitas nivel {PROFESSION_LEVEL}.", ephemeral=True)
+        return
+    if ch["profession"]:
+        await interaction.response.send_message("Ya tiene profesión.", ephemeral=True)
+        return
+    profs = await list_professions(interaction.guild_id)
+    if profesion not in profs:
+        await interaction.response.send_message("Profesión no existe.", ephemeral=True)
+        return
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute("UPDATE characters SET profession=? WHERE id=?", (profesion, char_id))
+        await db.commit()
+    await interaction.response.send_message(f"🛠️ **{ch['name']}** ahora es **{profesion}**.")
+
+@tree.command(name="dinero", description="Ver dinero de un PJ")
+@app_commands.describe(pj="Personaje")
+@app_commands.autocomplete(pj=ac_user_chars)
+async def dinero_cmd(interaction: discord.Interaction, pj: str):
+    ch = await get_character(int(pj))
+    if not ch:
+        await interaction.response.send_message("PJ no encontrado.", ephemeral=True)
+        return
+    await interaction.response.send_message(f"💰 **{ch['name']}** tiene **{ch['money']:,}** monedas.")
+
+@tree.command(name="inv", description="Inventario de un PJ")
+@app_commands.describe(pj="Personaje")
+@app_commands.autocomplete(pj=ac_user_chars)
+async def inv_cmd(interaction: discord.Interaction, pj: str):
+    ch = await get_character(int(pj))
+    if not ch:
+        await interaction.response.send_message("PJ no encontrado.", ephemeral=True)
+        return
+    items = await get_inventory(ch["id"])
+    if not items:
+        await interaction.response.send_message(f"🎒 Inventario de **{ch['name']}** vacío.")
+        return
+    text = "\n".join(f"• **{n}** x{q} — _{t}_" for n, q, t, *_ in items)
+    embed = discord.Embed(title=f"🎒 Inventario de {ch['name']}", description=text, color=discord.Color.green())
+    await interaction.response.send_message(embed=embed)
+
+@tree.command(name="dar-item", description="Dar ítem de tu PJ a otro PJ")
+@app_commands.describe(pj_origen="Tu personaje", pj_destino="ID del PJ destino", item="Ítem", cantidad="Cantidad")
+@app_commands.autocomplete(pj_origen=ac_user_chars, item=ac_inv_items)
+async def dar_item_cmd(
+    interaction: discord.Interaction,
+    pj_origen: str,
+    pj_destino: int,
+    item: str,
+    cantidad: app_commands.Range[int, 1, 1000] = 1,
+):
+    origen = await get_character(int(pj_origen))
+    dest = await get_character(pj_destino)
+    if not origen or origen["user_id"] != interaction.user.id:
+        await interaction.response.send_message("PJ origen inválido.", ephemeral=True)
+        return
+    if not dest or dest["guild_id"] != interaction.guild_id:
+        await interaction.response.send_message("PJ destino inválido.", ephemeral=True)
+        return
+    it = await get_item(origen["id"], item)
+    if not it or it[1] < cantidad:
+        await interaction.response.send_message("No tienes suficiente.", ephemeral=True)
+        return
+    data = json.loads(it[3] or "{}")
+    await add_item(origen["id"], item, -cantidad)
+    await add_item(dest["id"], item, cantidad, it[2], data, it[4] or "", it[5] or "")
     await interaction.response.send_message(
-        f"✅ {interaction.user.mention} le dio **{cantidad:,}** monedas a {usuario.mention}."
+        f"✅ **{origen['name']}** dio **{item}** x{cantidad} a **{dest['name']}**."
     )
 
-@tree.command(name="dar-item", description="Dale un ítem de tu inventario a otro jugador")
-@app_commands.describe(usuario="A quién se lo das", item="Nombre del ítem", cantidad="Cantidad (por defecto 1)")
-@app_commands.autocomplete(item=inventory_item_autocomplete)
-async def dar_item(interaction: discord.Interaction, usuario: discord.Member, item: str, cantidad: app_commands.Range[int, 1, 1000] = 1):
-    if usuario.id == interaction.user.id:
-        await interaction.response.send_message("❌ No puedes dártelo a ti mismo.", ephemeral=True)
+@tree.command(name="dar-dinero", description="Dar dinero de tu PJ a otro PJ")
+@app_commands.describe(pj_origen="Tu personaje", pj_destino="ID del PJ destino", cantidad="Monedas")
+@app_commands.autocomplete(pj_origen=ac_user_chars)
+async def dar_dinero_cmd(
+    interaction: discord.Interaction,
+    pj_origen: str,
+    pj_destino: int,
+    cantidad: app_commands.Range[int, 1, 1_000_000_000],
+):
+    origen = await get_character(int(pj_origen))
+    dest = await get_character(pj_destino)
+    if not origen or origen["user_id"] != interaction.user.id:
+        await interaction.response.send_message("PJ origen inválido.", ephemeral=True)
         return
-    if usuario.bot:
-        await interaction.response.send_message("❌ No puedes dárselo a un bot.", ephemeral=True)
+    if not dest:
+        await interaction.response.send_message("PJ destino inválido.", ephemeral=True)
         return
-    have = await get_item_qty(interaction.guild_id, interaction.user.id, item)
-    if have < cantidad:
-        await interaction.response.send_message(
-            f"❌ No tienes suficientes **{item}**. Tienes **{have}**.",
-            ephemeral=True
-        )
+    if origen["money"] < cantidad:
+        await interaction.response.send_message("No tienes suficiente dinero.", ephemeral=True)
         return
-    await add_item(interaction.guild_id, interaction.user.id, item, -cantidad)
-    await add_item(interaction.guild_id, usuario.id, item, cantidad)
+    await add_money(origen["id"], -cantidad)
+    await add_money(dest["id"], cantidad)
     await interaction.response.send_message(
-        f"✅ {interaction.user.mention} le dio **{item}** ×{cantidad} a {usuario.mention}."
+        f"💰 **{origen['name']}** dio **{cantidad:,}** a **{dest['name']}**."
     )
 
-@tree.command(name="tiendas", description="Lista las tiendas del servidor")
-async def tiendas(interaction: discord.Interaction):
+@tree.command(name="usar", description="Usar un ítem del inventario (mesa, poción, etc.)")
+@app_commands.describe(pj="Personaje", item="Ítem a usar")
+@app_commands.autocomplete(pj=ac_user_chars, item=ac_inv_items)
+async def usar_cmd(interaction: discord.Interaction, pj: str, item: str):
+    ch = await get_character(int(pj))
+    if not ch or ch["user_id"] != interaction.user.id:
+        await interaction.response.send_message("No es tu PJ.", ephemeral=True)
+        return
+    it = await get_item(ch["id"], item)
+    if not it:
+        await interaction.response.send_message("No tienes ese ítem.", ephemeral=True)
+        return
+    item_type = (it[2] or "").lower()
+    # Mesa
+    if "mesa" in item.lower() or item_type == "mesa":
+        prof = ch["profession"]
+        if not prof or prof == "Bardo":
+            await interaction.response.send_message("Este PJ no usa mesa de crafteo.", ephemeral=True)
+            return
+        expected = MESA_BY_PROF.get(prof, "")
+        if expected and expected.lower() not in item.lower() and item.lower() not in expected.lower():
+            # Permitir si el nombre contiene la profesión
+            if prof.lower() not in item.lower():
+                await interaction.response.send_message(
+                    f"Esta mesa no corresponde a tu profesión (**{prof}**).", ephemeral=True
+                )
+                return
+        await interaction.response.send_message(
+            f"🛠️ Mesa de **{prof}** — elige una opción:",
+            view=MesaView(ch["id"], prof),
+            ephemeral=True,
+        )
+        return
+    # Consumible simple fuera de combate
+    data = json.loads(it[3] or "{}")
+    if item_type in ("poción", "pocion", "elixir", "comida"):
+        await add_item(ch["id"], item, -1)
+        heal = int(data.get("CURA") or 0)
+        if heal:
+            stats = json.loads(ch["stats_json"] or "{}")
+            stats["VIDA"] = min(stats.get("VIDA_MAX", 20), stats.get("VIDA", 0) + heal)
+            async with aiosqlite.connect(DATABASE) as db:
+                await db.execute(
+                    "UPDATE characters SET stats_json=? WHERE id=?",
+                    (json.dumps(stats), ch["id"]),
+                )
+                await db.commit()
+        await interaction.response.send_message(f"✅ **{ch['name']}** usó **{item}**.")
+        return
+    await interaction.response.send_message(
+        "Este ítem se usa en combate o no tiene uso directo fuera.", ephemeral=True
+    )
+
+# ---- Tienda ----
+@tree.command(name="tiendas", description="Lista las tiendas")
+async def tiendas_cmd(interaction: discord.Interaction):
     shops = await get_shops(interaction.guild_id)
     if not shops:
-        await interaction.response.send_message("No hay tiendas creadas.")
+        await interaction.response.send_message("No hay tiendas.")
         return
-    text = "\n".join(f"• **{name}**" for _sid, name in shops)
-    embed = discord.Embed(title="🛒 Tiendas", description=text, color=discord.Color.orange())
-    embed.set_footer(text="Usa /ver-tienda para ver los productos")
+    embed = discord.Embed(
+        title="🛒 Tiendas",
+        description="\n".join(f"• **{n}**" for _i, n in shops),
+        color=discord.Color.orange(),
+    )
     await interaction.response.send_message(embed=embed)
 
-@tree.command(name="ver-tienda", description="Muestra los productos de una tienda")
-@app_commands.describe(tienda="Nombre de la tienda")
-@app_commands.autocomplete(tienda=shop_autocomplete)
+@tree.command(name="ver-tienda", description="Ver productos de una tienda")
+@app_commands.describe(tienda="Tienda")
+@app_commands.autocomplete(tienda=ac_shops)
 async def ver_tienda(interaction: discord.Interaction, tienda: str):
     shop = await get_shop_by_name(interaction.guild_id, tienda)
     if not shop:
-        await interaction.response.send_message("❌ Esa tienda no existe.", ephemeral=True)
+        await interaction.response.send_message("No existe.", ephemeral=True)
         return
     items = await get_shop_items(shop[0])
     if not items:
-        await interaction.response.send_message(f"La tienda **{tienda}** no tiene productos.")
+        await interaction.response.send_message("Tienda vacía.")
         return
     text = ""
-    for name, price, desc in items:
-        extra = f" — {desc}" if desc else ""
-        text += f"• **{name}** — {price:,} monedas{extra}\n"
+    thumb = None
+    for name, price, itype, desc, img, data in items:
+        text += f"• **{name}** ({itype}) — {price:,} 💰\n"
+        if img and not thumb:
+            thumb = img
     embed = discord.Embed(title=f"🛒 {tienda}", description=text, color=discord.Color.orange())
-    embed.set_footer(text="Usa /comprar para comprar")
+    if thumb:
+        embed.set_thumbnail(url=thumb)
     await interaction.response.send_message(embed=embed)
 
-@tree.command(name="comprar", description="Compra un ítem de una tienda")
-@app_commands.describe(tienda="Nombre de la tienda", item="Nombre del ítem", cantidad="Cantidad (por defecto 1)")
-@app_commands.autocomplete(tienda=shop_autocomplete, item=shop_item_autocomplete)
-async def comprar(interaction: discord.Interaction, tienda: str, item: str, cantidad: app_commands.Range[int, 1, 100] = 1):
+@tree.command(name="comprar", description="Comprar ítem para un PJ")
+@app_commands.describe(pj="Personaje que compra", tienda="Tienda", item="Ítem", cantidad="Cantidad")
+@app_commands.autocomplete(pj=ac_user_chars, tienda=ac_shops, item=ac_shop_items)
+async def comprar_cmd(
+    interaction: discord.Interaction,
+    pj: str,
+    tienda: str,
+    item: str,
+    cantidad: app_commands.Range[int, 1, 100] = 1,
+):
+    ch = await get_character(int(pj))
+    if not ch or ch["user_id"] != interaction.user.id:
+        await interaction.response.send_message("No es tu PJ.", ephemeral=True)
+        return
     shop = await get_shop_by_name(interaction.guild_id, tienda)
     if not shop:
-        await interaction.response.send_message("❌ Esa tienda no existe.", ephemeral=True)
+        await interaction.response.send_message("Tienda no existe.", ephemeral=True)
         return
     product = await get_shop_item(shop[0], item)
     if not product:
-        await interaction.response.send_message("❌ Ese ítem no está en esa tienda.", ephemeral=True)
+        await interaction.response.send_message("Ítem no está en la tienda.", ephemeral=True)
         return
-    price = product[1] * cantidad
-    money = await get_money(interaction.guild_id, interaction.user.id)
-    if money < price:
-        await interaction.response.send_message(
-            f"❌ Te faltan monedas. Cuesta **{price:,}** y tienes **{money:,}**.",
-            ephemeral=True
+    name, price, itype, desc, img, data_json = product
+    total = price * cantidad
+    if ch["money"] < total:
+        await interaction.response.send_message(f"Te faltan monedas ({total:,}).", ephemeral=True)
+        return
+    await add_money(ch["id"], -total)
+    data = json.loads(data_json or "{}")
+    await add_item(ch["id"], name, cantidad, itype, data, img or "", desc or "")
+    embed = discord.Embed(
+        title="✅ Compra realizada",
+        description=f"**{ch['name']}** compró **{name}** x{cantidad}\nPrecio: **{total:,}**",
+        color=discord.Color.green(),
+    )
+    if img:
+        embed.set_thumbnail(url=img)
+    await interaction.response.send_message(embed=embed)
+
+@tree.command(name="recetas", description="Lista recetas de crafteo")
+async def recetas_cmd(interaction: discord.Interaction):
+    recipes = await get_recipes(interaction.guild_id)
+    if not recipes:
+        await interaction.response.send_message("No hay recetas.")
+        return
+    lines = [
+        f"**{r[1]}** [{r[3]}] — {r[2]} → {r[4]} (ID {r[0]})"
+        for r in recipes[:30]
+    ]
+    embed = discord.Embed(title="📜 Recetas", description="\n".join(lines), color=discord.Color.teal())
+    await interaction.response.send_message(embed=embed)
+
+# ---- Combate ----
+@tree.command(name="duelo", description="Inicia un combate")
+@app_commands.describe(
+    tu_pj="Tu personaje",
+    enemigo="Usuario enemigo",
+    enemigo_pj_id="ID del PJ enemigo",
+    tipo="amistoso o muerte",
+    tu_rol="Tu rol",
+    enemigo_rol="Rol del enemigo",
+)
+@app_commands.autocomplete(tu_pj=ac_user_chars)
+@app_commands.choices(
+    tipo=[
+        app_commands.Choice(name="Amistoso", value="amistoso"),
+        app_commands.Choice(name="A muerte", value="muerte"),
+    ],
+    tu_rol=[
+        app_commands.Choice(name="Atacante", value="Atacante"),
+        app_commands.Choice(name="Tanque", value="Tanque"),
+        app_commands.Choice(name="Mago", value="Mago"),
+    ],
+    enemigo_rol=[
+        app_commands.Choice(name="Atacante", value="Atacante"),
+        app_commands.Choice(name="Tanque", value="Tanque"),
+        app_commands.Choice(name="Mago", value="Mago"),
+    ],
+)
+async def duelo_cmd(
+    interaction: discord.Interaction,
+    tu_pj: str,
+    enemigo: discord.Member,
+    enemigo_pj_id: int,
+    tipo: str = "amistoso",
+    tu_rol: str = "Atacante",
+    enemigo_rol: str = "Atacante",
+):
+    a = await get_character(int(tu_pj))
+    b = await get_character(enemigo_pj_id)
+    if not a or a["user_id"] != interaction.user.id:
+        await interaction.response.send_message("Tu PJ inválido.", ephemeral=True)
+        return
+    if not b or b["user_id"] != enemigo.id:
+        await interaction.response.send_message("PJ enemigo inválido.", ephemeral=True)
+        return
+    if await get_active_combat_for_char(a["id"]) or await get_active_combat_for_char(b["id"]):
+        await interaction.response.send_message("Uno de los PJs ya está en combate.", ephemeral=True)
+        return
+    sa = json.loads(a["stats_json"] or "{}")
+    sb = json.loads(b["stats_json"] or "{}")
+    async with aiosqlite.connect(DATABASE) as db:
+        cur = await db.execute(
+            """INSERT INTO combats (guild_id, channel_id, combat_type, status, turn_index, log_json)
+               VALUES (?,?,?,'active',0,?)""",
+            (interaction.guild_id, interaction.channel_id, tipo, json.dumps([f"Combate {tipo} iniciado."])),
         )
+        combat_id = cur.lastrowid
+        await db.execute(
+            """INSERT INTO combat_participants
+               (combat_id, character_id, user_id, team, role, vida, mana, stats_json, effects_json, alive)
+               VALUES (?,?,?,?,?,?,?,?,?,1)""",
+            (combat_id, a["id"], a["user_id"], 0, tu_rol, sa.get("VIDA", 20), sa.get("MANA", 10), a["stats_json"], "[]"),
+        )
+        await db.execute(
+            """INSERT INTO combat_participants
+               (combat_id, character_id, user_id, team, role, vida, mana, stats_json, effects_json, alive)
+               VALUES (?,?,?,?,?,?,?,?,?,1)""",
+            (combat_id, b["id"], b["user_id"], 1, enemigo_rol, sb.get("VIDA", 20), sb.get("MANA", 10), b["stats_json"], "[]"),
+        )
+        await db.commit()
+    embed = discord.Embed(
+        title="⚔️ Combate iniciado",
+        description=f"**{a['name']}** vs **{b['name']}**\nTipo: **{tipo}**\nEmpieza: **{a['name']}**",
+        color=discord.Color.red(),
+    )
+    await interaction.response.send_message(embed=embed, view=CombatView(combat_id))
+
+@tree.command(name="combate", description="Estado del combate de tu PJ")
+@app_commands.describe(pj="Personaje")
+@app_commands.autocomplete(pj=ac_user_chars)
+async def combate_cmd(interaction: discord.Interaction, pj: str):
+    char_id = int(pj)
+    combat_id = await get_active_combat_for_char(char_id)
+    if not combat_id:
+        await interaction.response.send_message("Ese PJ no está en combate.", ephemeral=True)
         return
-    await add_money(interaction.guild_id, interaction.user.id, -price)
-    await add_item(interaction.guild_id, interaction.user.id, product[0], cantidad)
+    parts = await get_participants(combat_id)
+    lines = []
+    for p in parts:
+        ch = await get_character(p["character_id"])
+        status = "✅" if p["alive"] else "💀"
+        lines.append(f"{status} **{ch['name'] if ch else p['character_id']}** — ❤️ {p['vida']} | 💧 {p['mana']} | {p['role']}")
     await interaction.response.send_message(
-        f"✅ Compraste **{product[0]}** ×{cantidad} por **{price:,}** monedas.\nSe guardó en tu inventario."
+        embed=discord.Embed(title=f"⚔️ Combate #{combat_id}", description="\n".join(lines), color=discord.Color.orange()),
+        view=CombatView(combat_id),
     )
 
-# ==================== ADMIN XP ====================
-@tree.command(name="dar-xp", description="Da XP a un usuario")
-@admin_only()
-async def dar_xp(interaction: discord.Interaction, usuario: discord.Member, cantidad: app_commands.Range[int, 1, 1000000]):
-    new_xp, new_level, leveled_up = await add_xp(interaction.guild_id, usuario.id, cantidad)
-    user_class = await get_user_class(interaction.guild_id, usuario.id)
-    msg = f"✅ **{cantidad:,} XP** a {usuario.mention}. Ahora: **{new_xp:,} XP** (Nivel {new_level})"
-    if leveled_up and user_class:
-        await send_levelup_message(interaction.guild, usuario, new_level, user_class)
-    await interaction.response.send_message(msg)
-
-@tree.command(name="quitar-xp", description="Quita XP a un usuario")
-@admin_only()
-async def quitar_xp(interaction: discord.Interaction, usuario: discord.Member, cantidad: app_commands.Range[int, 1, 1000000]):
-    new_xp, new_level, _ = await add_xp(interaction.guild_id, usuario.id, -cantidad)
-    await interaction.response.send_message(
-        f"✅ Quitados **{cantidad:,} XP** a {usuario.mention}. Ahora: **{new_xp:,} XP** (Nivel {new_level})"
-    )
-
-@tree.command(name="ver-xp", description="Ver XP de un usuario")
-@admin_only()
-async def ver_xp(interaction: discord.Interaction, usuario: discord.Member):
-    data = await get_user_data(interaction.guild_id, usuario.id)
-    user_class = await get_user_class(interaction.guild_id, usuario.id)
-    await interaction.response.send_message(
-        f"📊 {usuario.mention}: **{data['xp']:,} XP** | Nivel **{data['level']}** | Clase: **{user_class or 'Sin clase'}**"
-    )
-
-@tree.command(name="dar-xp-rol", description="Da XP a un rol")
-@admin_only()
-async def dar_xp_rol(interaction: discord.Interaction, rol: discord.Role, cantidad: app_commands.Range[int, 1, 100000]):
-    await interaction.response.defer()
-    members = [m for m in rol.members if not m.bot]
-    for m in members:
-        await add_xp(interaction.guild_id, m.id, cantidad)
-    await interaction.followup.send(f"✅ **{cantidad:,} XP** a **{len(members)}** miembros de {rol.mention}.")
-
-@tree.command(name="quitar-xp-rol", description="Quita XP a un rol")
-@admin_only()
-async def quitar_xp_rol(interaction: discord.Interaction, rol: discord.Role, cantidad: app_commands.Range[int, 1, 100000]):
-    await interaction.response.defer()
-    members = [m for m in rol.members if not m.bot]
-    for m in members:
-        await add_xp(interaction.guild_id, m.id, -cantidad)
-    await interaction.followup.send(f"✅ Quitados **{cantidad:,} XP** a **{len(members)}** miembros de {rol.mention}.")
-
-@tree.command(name="resetear-xp", description="Resetea XP de un usuario")
-@admin_only()
-async def resetear_xp(interaction: discord.Interaction, usuario: discord.Member):
-    await set_user_xp(interaction.guild_id, usuario.id, 0)
-    await interaction.response.send_message(f"✅ XP de {usuario.mention} reseteado.")
-
-@tree.command(name="resetear-xp-rol", description="Resetea XP de un rol")
-@admin_only()
-async def resetear_xp_rol(interaction: discord.Interaction, rol: discord.Role):
-    await interaction.response.defer()
-    members = [m for m in rol.members if not m.bot]
-    for m in members:
-        await set_user_xp(interaction.guild_id, m.id, 0)
-    await interaction.followup.send(f"✅ XP reseteado a **{len(members)}** miembros de {rol.mention}.")
-
-@tree.command(name="añadir-clase", description="Crea una clase")
-@admin_only()
-async def añadir_clase(interaction: discord.Interaction, nombre: str):
-    if await add_class(interaction.guild_id, nombre.strip()):
-        await interaction.response.send_message(f"✅ Clase **{nombre}** creada.")
-    else:
-        await interaction.response.send_message("❌ Ya existe.", ephemeral=True)
-
-@tree.command(name="borrar-clase", description="Borra una clase")
-@admin_only()
-async def borrar_clase(interaction: discord.Interaction, nombre: str):
-    if not await class_exists(interaction.guild_id, nombre):
-        await interaction.response.send_message("❌ No existe.", ephemeral=True)
+@tree.command(name="log", description="Ver log del combate de un PJ")
+@app_commands.describe(pj="Personaje")
+@app_commands.autocomplete(pj=ac_user_chars)
+async def log_cmd(interaction: discord.Interaction, pj: str):
+    combat_id = await get_active_combat_for_char(int(pj))
+    if not combat_id:
+        # último combate? solo activos por ahora
+        await interaction.response.send_message("Sin combate activo.", ephemeral=True)
         return
-    await remove_class(interaction.guild_id, nombre)
-    await interaction.response.send_message(f"✅ Clase **{nombre}** eliminada.")
-
-@tree.command(name="añadir-recompensa", description="Añade recompensas a un nivel")
-@admin_only()
-async def añadir_recompensa(interaction: discord.Interaction, clase: str, nivel: app_commands.Range[int, 1, 500], recompensas: str):
-    if not await class_exists(interaction.guild_id, clase):
-        await interaction.response.send_message("❌ Clase no existe.", ephemeral=True)
-        return
-    items = [r.strip() for r in recompensas.split("|") if r.strip()]
-    await set_rewards(interaction.guild_id, clase, nivel, items)
+    combat = await get_combat(combat_id)
+    log = json.loads(combat.get("log_json") or "[]")
     await interaction.response.send_message(
-        f"✅ Recompensas en **{clase}** nivel **{nivel}**:\n" + "\n".join(f"• {i}" for i in items)
+        "📜 **Log**\n" + ("\n".join(log[-25:]) if log else "Vacío"),
+        ephemeral=True,
     )
 
-@tree.command(name="borrar-recompensa", description="Borra recompensas de un nivel")
+@tree.command(name="fin-combate", description="Admin: fuerza el fin de un combate")
 @admin_only()
-async def borrar_recompensa(interaction: discord.Interaction, clase: str, nivel: app_commands.Range[int, 1, 500]):
-    await delete_rewards(interaction.guild_id, clase, nivel)
-    await interaction.response.send_message(f"✅ Recompensas del nivel **{nivel}** eliminadas.")
+@app_commands.describe(combat_id="ID del combate")
+async def fin_combate(interaction: discord.Interaction, combat_id: int):
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute("UPDATE combats SET status='ended' WHERE id=?", (combat_id,))
+        await db.commit()
+    await interaction.response.send_message(f"🛑 Combate `{combat_id}` finalizado por admin.")
 
-@tree.command(name="resetear-clase", description="Quita la clase a un usuario")
+# ---- Admin content ----
+@tree.command(name="crear-clase", description="Admin: crear clase")
 @admin_only()
-async def resetear_clase(interaction: discord.Interaction, usuario: discord.Member):
-    current = await get_user_class(interaction.guild_id, usuario.id)
-    if not current:
-        await interaction.response.send_message("No tiene clase.", ephemeral=True)
-        return
-    await remove_user_class(interaction.guild_id, usuario.id)
-    await interaction.response.send_message(f"✅ Se quitó la clase **{current}** a {usuario.mention}.")
+@app_commands.describe(nombre="Nombre", descripcion="Descripción con códigos $FUE=5 $VIDA_MAX=20 etc.")
+async def crear_clase(interaction: discord.Interaction, nombre: str, descripcion: str = ""):
+    stats = parse_codes(descripcion)
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute(
+            """INSERT INTO classes (guild_id, name, description, stats_json) VALUES (?,?,?,?)
+               ON CONFLICT(guild_id, name) DO UPDATE SET description=excluded.description, stats_json=excluded.stats_json""",
+            (interaction.guild_id, nombre.strip(), descripcion, json.dumps(stats)),
+        )
+        await db.commit()
+    await interaction.response.send_message(f"✅ Clase **{nombre}** guardada.\nStats: `{stats}`")
 
-@tree.command(name="set-nivel-maximo", description="Nivel máximo (0 = sin límite)")
-@admin_only()
-async def set_nivel_maximo(interaction: discord.Interaction, nivel: app_commands.Range[int, 0, 500]):
-    await set_max_level(interaction.guild_id, nivel)
-    await interaction.response.send_message("✅ Límite eliminado." if nivel == 0 else f"✅ Nivel máximo: **{nivel}**")
-
-# ==================== ADMIN ECONOMÍA / TIENDAS ====================
-@tree.command(name="dar-dinero", description="Da dinero a un usuario (admin)")
-@admin_only()
-async def dar_dinero(interaction: discord.Interaction, usuario: discord.Member, cantidad: app_commands.Range[int, 1, 100000000]):
-    new_amount = await add_money(interaction.guild_id, usuario.id, cantidad)
+@tree.command(name="clases", description="Lista de clases")
+async def clases_cmd(interaction: discord.Interaction):
+    classes = await list_classes(interaction.guild_id)
     await interaction.response.send_message(
-        f"✅ Se dieron **{cantidad:,}** monedas a {usuario.mention}. Ahora tiene **{new_amount:,}**."
+        "⚔️ **Clases:** " + (", ".join(classes) if classes else "Ninguna")
     )
 
-@tree.command(name="quitar-dinero", description="Quita dinero a un usuario (admin)")
+@tree.command(name="crear-profesion", description="Admin: crear profesión")
 @admin_only()
-async def quitar_dinero(interaction: discord.Interaction, usuario: discord.Member, cantidad: app_commands.Range[int, 1, 100000000]):
-    new_amount = await add_money(interaction.guild_id, usuario.id, -cantidad)
+@app_commands.describe(nombre="Nombre", descripcion="Descripción")
+async def crear_profesion(interaction: discord.Interaction, nombre: str, descripcion: str = ""):
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute(
+            """INSERT INTO professions (guild_id, name, description) VALUES (?,?,?)
+               ON CONFLICT(guild_id, name) DO UPDATE SET description=excluded.description""",
+            (interaction.guild_id, nombre.strip(), descripcion),
+        )
+        await db.commit()
+    await interaction.response.send_message(f"✅ Profesión **{nombre}** creada.")
+
+@tree.command(name="profesiones", description="Lista profesiones")
+async def profesiones_cmd(interaction: discord.Interaction):
+    profs = await list_professions(interaction.guild_id)
     await interaction.response.send_message(
-        f"✅ Se quitaron **{cantidad:,}** monedas a {usuario.mention}. Ahora tiene **{new_amount:,}**."
+        "🛠️ **Profesiones:** " + (", ".join(profs) if profs else "Ninguna")
     )
 
-@tree.command(name="crear-tienda", description="Crea una tienda nueva")
+@tree.command(name="crear-tienda", description="Admin: crear tienda")
 @admin_only()
 async def crear_tienda(interaction: discord.Interaction, nombre: str):
-    if await create_shop(interaction.guild_id, nombre.strip()):
-        await interaction.response.send_message(f"✅ Tienda **{nombre}** creada.")
-    else:
-        await interaction.response.send_message("❌ Ya existe una tienda con ese nombre.", ephemeral=True)
+    if await get_shop_by_name(interaction.guild_id, nombre):
+        await interaction.response.send_message("Ya existe.", ephemeral=True)
+        return
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute("INSERT INTO shops (guild_id, name) VALUES (?,?)", (interaction.guild_id, nombre.strip()))
+        await db.commit()
+    await interaction.response.send_message(f"✅ Tienda **{nombre}** creada.")
 
-@tree.command(name="borrar-tienda", description="Borra una tienda y sus productos")
+@tree.command(name="borrar-tienda", description="Admin: borrar tienda")
 @admin_only()
-@app_commands.describe(nombre="Tienda a borrar")
-@app_commands.autocomplete(nombre=shop_autocomplete)
-async def borrar_tienda(interaction: discord.Interaction, nombre: str):
-    if await delete_shop(interaction.guild_id, nombre):
-        await interaction.response.send_message(f"✅ Tienda **{nombre}** eliminada.")
-    else:
-        await interaction.response.send_message("❌ Esa tienda no existe.", ephemeral=True)
-
-@tree.command(name="item-tienda", description="Añade un producto a una tienda")
-@admin_only()
-@app_commands.describe(tienda="Nombre de la tienda", item="Nombre del ítem", precio="Precio", descripcion="Descripción opcional")
-@app_commands.autocomplete(tienda=shop_autocomplete)
-async def item_tienda(interaction: discord.Interaction, tienda: str, item: str, precio: app_commands.Range[int, 1, 100000000], descripcion: str = ""):
+@app_commands.describe(tienda="Tienda")
+@app_commands.autocomplete(tienda=ac_shops)
+async def borrar_tienda(interaction: discord.Interaction, tienda: str):
     shop = await get_shop_by_name(interaction.guild_id, tienda)
     if not shop:
-        await interaction.response.send_message("❌ Esa tienda no existe.", ephemeral=True)
+        await interaction.response.send_message("No existe.", ephemeral=True)
         return
-    await add_shop_item(shop[0], item, precio, descripcion)
-    await interaction.response.send_message(f"✅ **{item}** añadido a **{tienda}** por **{precio:,}** monedas.")
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute("DELETE FROM shop_items WHERE shop_id=?", (shop[0],))
+        await db.execute("DELETE FROM shops WHERE id=?", (shop[0],))
+        await db.commit()
+    await interaction.response.send_message(f"🗑️ Tienda **{tienda}** eliminada.")
 
-@tree.command(name="quitar-item-tienda", description="Quita un producto de una tienda")
-@admin_only()
-@app_commands.describe(tienda="Nombre de la tienda", item="Ítem a quitar")
-@app_commands.autocomplete(tienda=shop_autocomplete, item=shop_item_autocomplete)
-async def quitar_item_tienda(interaction: discord.Interaction, tienda: str, item: str):
-    shop = await get_shop_by_name(interaction.guild_id, tienda)
-    if not shop:
-        await interaction.response.send_message("❌ Esa tienda no existe.", ephemeral=True)
-        return
-    await remove_shop_item(shop[0], item)
-    await interaction.response.send_message(f"✅ **{item}** eliminado de **{tienda}**.")
-
-# ==================== EMBEDS / AUTO / PROGRAMADOS ====================
-@tree.command(name="embed", description="Crea y envía un embed")
+@tree.command(name="item-tienda", description="Admin: añadir ítem a tienda")
 @admin_only()
 @app_commands.describe(
-    canal="Canal destino",
-    titulo="Título",
-    descripcion="Descripción",
-    color="Color hex (ej: FF0000)",
-    footer="Pie de página",
-    imagen="URL de imagen grande",
-    thumbnail="URL de miniatura"
+    tienda="Tienda", item="Nombre", precio="Precio", tipo="Tipo",
+    descripcion="Descripción con códigos $DAÑO=5 $DUR=10 etc.",
+    imagen="URL imagen",
 )
-async def crear_embed(
+@app_commands.autocomplete(tienda=ac_shops)
+async def item_tienda_cmd(
+    interaction: discord.Interaction,
+    tienda: str,
+    item: str,
+    precio: app_commands.Range[int, 1, 1_000_000_000],
+    tipo: str = "Arma",
+    descripcion: str = "",
+    imagen: str = "",
+):
+    shop = await get_shop_by_name(interaction.guild_id, tienda)
+    if not shop:
+        await interaction.response.send_message("Tienda no existe.", ephemeral=True)
+        return
+    data = parse_codes(descripcion)
+    if "DUR" in data and "DUR_MAX" not in data:
+        data["DUR_MAX"] = data["DUR"]
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute(
+            """INSERT INTO shop_items (shop_id, item_name, price, item_type, description, image_url, data_json)
+               VALUES (?,?,?,?,?,?,?)""",
+            (shop[0], item, precio, tipo, descripcion, imagen, json.dumps(data)),
+        )
+        await db.commit()
+    embed = discord.Embed(title="✅ Ítem añadido", description=f"**{item}** en **{tienda}**", color=discord.Color.orange())
+    embed.add_field(name="Precio", value=f"{precio:,}", inline=True)
+    embed.add_field(name="Tipo", value=tipo, inline=True)
+    if data:
+        embed.add_field(name="Stats", value=str(data), inline=False)
+    if imagen:
+        embed.set_thumbnail(url=imagen)
+    await interaction.response.send_message(embed=embed)
+
+@tree.command(name="quitar-item", description="Admin: quitar ítem de tienda")
+@admin_only()
+@app_commands.describe(tienda="Tienda", item="Ítem")
+@app_commands.autocomplete(tienda=ac_shops, item=ac_shop_items)
+async def quitar_item_cmd(interaction: discord.Interaction, tienda: str, item: str):
+    shop = await get_shop_by_name(interaction.guild_id, tienda)
+    if not shop:
+        await interaction.response.send_message("No existe.", ephemeral=True)
+        return
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute("DELETE FROM shop_items WHERE shop_id=? AND item_name=?", (shop[0], item))
+        await db.commit()
+    await interaction.response.send_message(f"🗑️ **{item}** eliminado de **{tienda}**.")
+
+@tree.command(name="crear-material", description="Admin: crear material de crafteo")
+@admin_only()
+@app_commands.describe(nombre="Nombre", descripcion="Descripción", imagen="URL")
+async def crear_material(interaction: discord.Interaction, nombre: str, descripcion: str = "", imagen: str = ""):
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute(
+            """INSERT INTO materials (guild_id, name, description, image_url) VALUES (?,?,?,?)
+               ON CONFLICT(guild_id, name) DO UPDATE SET description=excluded.description, image_url=excluded.image_url""",
+            (interaction.guild_id, nombre.strip(), descripcion, imagen),
+        )
+        await db.commit()
+    await interaction.response.send_message(f"✅ Material **{nombre}** creado. Añádelo a tiendas o inv con admin `/craftear`.")
+
+@tree.command(name="crear-receta", description="Admin: crear receta de crafteo")
+@admin_only()
+@app_commands.describe(
+    nombre="Nombre de la receta",
+    profesion="Profesión requerida",
+    grado="Comun/Refinado/Superior/Magistral",
+    resultado="Nombre del ítem resultante",
+    tipo_resultado="Arma/Armadura/Artefacto/Poción...",
+    materiales="Ej: Hierro:2,Madera:1",
+    stats_resultado="Códigos $DAÑO=5 $DUR=10",
+    con_magia="¿Requiere material mágico?",
+    material_magico="Nombre del material de afinidad",
+    imagen="URL",
+)
+@app_commands.autocomplete(profesion=ac_professions)
+@app_commands.choices(grado=[
+    app_commands.Choice(name="Comun", value="Comun"),
+    app_commands.Choice(name="Refinado", value="Refinado"),
+    app_commands.Choice(name="Superior", value="Superior"),
+    app_commands.Choice(name="Magistral", value="Magistral"),
+])
+async def crear_receta(
+    interaction: discord.Interaction,
+    nombre: str,
+    profesion: str,
+    grado: str,
+    resultado: str,
+    tipo_resultado: str = "Arma",
+    materiales: str = "",
+    stats_resultado: str = "",
+    con_magia: bool = False,
+    material_magico: str = "",
+    imagen: str = "",
+):
+    mats = {}
+    for part in materiales.split(","):
+        part = part.strip()
+        if ":" in part:
+            k, v = part.split(":", 1)
+            try:
+                mats[k.strip()] = int(v.strip())
+            except ValueError:
+                pass
+    data = parse_codes(stats_resultado)
+    if "DUR" in data:
+        data["DUR_MAX"] = data["DUR"]
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute(
+            """INSERT INTO recipes
+               (guild_id, name, profession, grade, result_name, result_type, result_data, materials_json, needs_magic, magic_material, image_url)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                interaction.guild_id, nombre, profesion, grado, resultado, tipo_resultado,
+                json.dumps(data), json.dumps(mats), 1 if con_magia else 0, material_magico, imagen,
+            ),
+        )
+        await db.commit()
+    await interaction.response.send_message(
+        f"✅ Receta **{nombre}** creada.\nMateriales: `{mats}`\nStats: `{data}`"
+    )
+
+@tree.command(name="craftear", description="Admin: crear ítem directo en inventario de un PJ")
+@admin_only()
+@app_commands.describe(pj_id="ID del personaje", item="Nombre", tipo="Tipo", cantidad="Cantidad", stats="Códigos $DAÑO=5", imagen="URL")
+async def admin_craftear(
+    interaction: discord.Interaction,
+    pj_id: int,
+    item: str,
+    tipo: str = "Arma",
+    cantidad: app_commands.Range[int, 1, 1000] = 1,
+    stats: str = "",
+    imagen: str = "",
+):
+    ch = await get_character(pj_id)
+    if not ch:
+        await interaction.response.send_message("PJ no existe.", ephemeral=True)
+        return
+    data = parse_codes(stats)
+    if "DUR" in data:
+        data["DUR_MAX"] = data["DUR"]
+    await add_item(pj_id, item, cantidad, tipo, data, imagen, stats)
+    await interaction.response.send_message(f"✅ Admin dio **{item}** x{cantidad} a **{ch['name']}**.")
+
+@tree.command(name="reparar", description="Admin: reparar arma de un PJ (restaura DUR)")
+@admin_only()
+@app_commands.describe(pj_id="ID del PJ", arma="Nombre del arma")
+async def admin_reparar(interaction: discord.Interaction, pj_id: int, arma: str):
+    it = await get_item(pj_id, arma)
+    if not it:
+        await interaction.response.send_message("Ítem no encontrado.", ephemeral=True)
+        return
+    data = json.loads(it[3] or "{}")
+    if "DUR_MAX" in data:
+        data["DUR"] = data["DUR_MAX"]
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute(
+            "UPDATE inventory SET data_json=? WHERE character_id=? AND item_name=?",
+            (json.dumps(data), pj_id, arma),
+        )
+        await db.commit()
+    await interaction.response.send_message(f"🔧 **{arma}** reparada (admin).")
+
+@tree.command(name="dar-xp", description="Admin: dar XP a un PJ")
+@admin_only()
+@app_commands.describe(pj_id="ID del PJ", cantidad="XP")
+async def dar_xp_cmd(interaction: discord.Interaction, pj_id: int, cantidad: app_commands.Range[int, 1, 10_000_000]):
+    ch = await get_character(pj_id)
+    if not ch:
+        await interaction.response.send_message("PJ no existe.", ephemeral=True)
+        return
+    await grant_xp(pj_id, cantidad, interaction.channel)
+    ch2 = await get_character(pj_id)
+    await interaction.response.send_message(f"✅ +{cantidad} XP a **{ch['name']}** → Nv.{ch2['level']} ({ch2['xp']} XP)")
+
+@tree.command(name="quitar-xp", description="Admin: quitar XP a un PJ")
+@admin_only()
+@app_commands.describe(pj_id="ID del PJ", cantidad="XP")
+async def quitar_xp_cmd(interaction: discord.Interaction, pj_id: int, cantidad: app_commands.Range[int, 1, 10_000_000]):
+    ch = await get_character(pj_id)
+    if not ch:
+        await interaction.response.send_message("PJ no existe.", ephemeral=True)
+        return
+    new_xp = max(0, ch["xp"] - cantidad)
+    new_level = calculate_level(new_xp)
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute("UPDATE characters SET xp=?, level=? WHERE id=?", (new_xp, new_level, pj_id))
+        await db.commit()
+    await interaction.response.send_message(f"✅ XP actualizado: **{new_xp}** (Nv.{new_level})")
+
+@tree.command(name="ver-xp", description="Ver XP de un PJ")
+@app_commands.describe(pj="Personaje")
+@app_commands.autocomplete(pj=ac_user_chars)
+async def ver_xp_cmd(interaction: discord.Interaction, pj: str):
+    ch = await get_character(int(pj))
+    if not ch:
+        await interaction.response.send_message("No encontrado.", ephemeral=True)
+        return
+    await interaction.response.send_message(
+        f"📊 **{ch['name']}** — Nivel **{ch['level']}** | XP **{ch['xp']}** | Rango **{rank_from_level(ch['level'])}**"
+    )
+
+@tree.command(name="dar-dinero", description="Admin: dar dinero a un PJ")
+@admin_only()
+@app_commands.describe(pj_id="ID del PJ", cantidad="Monedas")
+async def admin_dar_dinero(interaction: discord.Interaction, pj_id: int, cantidad: app_commands.Range[int, 1, 1_000_000_000]):
+    ch = await get_character(pj_id)
+    if not ch:
+        await interaction.response.send_message("PJ no existe.", ephemeral=True)
+        return
+    new = await add_money(pj_id, cantidad)
+    await interaction.response.send_message(f"💰 **{ch['name']}** ahora tiene **{new:,}**.")
+
+@tree.command(name="quitar-dinero", description="Admin: quitar dinero a un PJ")
+@admin_only()
+@app_commands.describe(pj_id="ID del PJ", cantidad="Monedas")
+async def admin_quitar_dinero(interaction: discord.Interaction, pj_id: int, cantidad: app_commands.Range[int, 1, 1_000_000_000]):
+    ch = await get_character(pj_id)
+    if not ch:
+        await interaction.response.send_message("PJ no existe.", ephemeral=True)
+        return
+    new = await add_money(pj_id, -cantidad)
+    await interaction.response.send_message(f"💰 **{ch['name']}** ahora tiene **{new:,}**.")
+
+@tree.command(name="config-nivel", description="Admin: nivel máximo del server")
+@admin_only()
+@app_commands.describe(maximo="Nivel máximo (ej. 50)")
+async def config_nivel(interaction: discord.Interaction, maximo: app_commands.Range[int, 1, 500]):
+    await set_guild_field(interaction.guild_id, "max_level", maximo)
+    await interaction.response.send_message(f"✅ Nivel máximo: **{maximo}**")
+
+@tree.command(name="reward-nivel", description="Admin: recompensas/stats al subir de nivel")
+@admin_only()
+@app_commands.describe(nivel="Nivel", recompensas="Texto separado por |", stats="Códigos $FUE=1 $VIDA_MAX=2")
+async def reward_nivel(interaction: discord.Interaction, nivel: app_commands.Range[int, 1, 500], recompensas: str = "", stats: str = ""):
+    rw = [x.strip() for x in recompensas.split("|") if x.strip()]
+    st = parse_codes(stats)
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute(
+            """INSERT INTO level_rewards (guild_id, level, rewards, stats_json) VALUES (?,?,?,?)
+               ON CONFLICT(guild_id, level) DO UPDATE SET rewards=excluded.rewards, stats_json=excluded.stats_json""",
+            (interaction.guild_id, nivel, json.dumps(rw), json.dumps(st)),
+        )
+        await db.commit()
+    await interaction.response.send_message(f"✅ Nivel {nivel}: rewards={rw} stats={st}")
+
+@tree.command(name="canal-xp", description="Admin: canal donde se gana XP escribiendo")
+@admin_only()
+@app_commands.describe(canal="Canal de XP (omitir para desactivar)")
+async def canal_xp(interaction: discord.Interaction, canal: discord.TextChannel = None):
+    await set_guild_field(interaction.guild_id, "xp_channel_id", canal.id if canal else None)
+    if canal:
+        await interaction.response.send_message(f"✅ XP de mensajes en {canal.mention}")
+    else:
+        await interaction.response.send_message("✅ XP por mensajes desactivado.")
+
+@tree.command(name="roles-admin", description="Admin: roles que pueden usar comandos admin")
+@admin_only()
+async def roles_admin(interaction: discord.Interaction, rol1: discord.Role, rol2: discord.Role = None, rol3: discord.Role = None):
+    roles = [rol1.id]
+    for r in (rol2, rol3):
+        if r and r.id not in roles:
+            roles.append(r.id)
+    await set_guild_field(interaction.guild_id, "admin_roles", json.dumps(roles))
+    await interaction.response.send_message("✅ Roles admin actualizados.")
+
+@tree.command(name="config", description="Admin: ver configuración")
+@admin_only()
+async def config_cmd(interaction: discord.Interaction):
+    cfg = await get_guild_config(interaction.guild_id)
+    classes = await list_classes(interaction.guild_id)
+    profs = await list_professions(interaction.guild_id)
+    embed = discord.Embed(title="⚙️ Configuración", color=discord.Color.blue())
+    embed.add_field(name="Nivel máx.", value=str(cfg["max_level"]), inline=True)
+    embed.add_field(name="Canal XP", value=str(cfg["xp_channel_id"] or "—"), inline=True)
+    embed.add_field(name="Clases", value=", ".join(classes) or "—", inline=False)
+    embed.add_field(name="Profesiones", value=", ".join(profs) or "—", inline=False)
+    await interaction.response.send_message(embed=embed)
+
+@tree.command(name="embed", description="Admin: crear un embed")
+@admin_only()
+@app_commands.describe(canal="Canal", titulo="Título", descripcion="Descripción", color="Hex", imagen="URL", thumbnail="URL mini")
+async def embed_cmd(
     interaction: discord.Interaction,
     canal: discord.TextChannel,
     titulo: str = None,
     descripcion: str = None,
     color: str = "5865F2",
-    footer: str = None,
     imagen: str = None,
-    thumbnail: str = None
+    thumbnail: str = None,
 ):
     try:
-        color_value = int(color.replace("#", ""), 16)
+        color_val = int(color.replace("#", ""), 16)
     except Exception:
-        color_value = 0x5865F2
-    embed = discord.Embed(color=color_value)
+        color_val = 0x5865F2
+    emb = discord.Embed(color=color_val)
     if titulo:
-        embed.title = titulo
+        emb.title = titulo
     if descripcion:
-        embed.description = descripcion
-    if footer:
-        embed.set_footer(text=footer)
+        emb.description = descripcion
     if imagen:
-        embed.set_image(url=imagen)
+        emb.set_image(url=imagen)
     if thumbnail:
-        embed.set_thumbnail(url=thumbnail)
-    try:
-        await canal.send(embed=embed)
-        await interaction.response.send_message(f"✅ Embed enviado en {canal.mention}", ephemeral=True)
-    except Exception as e:
-        await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
+        emb.set_thumbnail(url=thumbnail)
+    await canal.send(embed=emb)
+    await interaction.response.send_message(f"✅ Embed enviado en {canal.mention}", ephemeral=True)
 
-@tree.command(name="auto-mensaje", description="Mensaje automático por palabra clave")
-@admin_only()
-@app_commands.describe(
-    palabra="Palabra que activa",
-    respuestas="Respuestas separadas por |",
-    canales="IDs de canales separados por coma (vacío = todos)"
-)
-async def auto_mensaje(interaction: discord.Interaction, palabra: str, respuestas: str, canales: str = None):
-    resp_list = [r.strip() for r in respuestas.split("|") if r.strip()]
-    if not resp_list:
-        await interaction.response.send_message("❌ Pon al menos una respuesta.", ephemeral=True)
-        return
-    channel_ids = []
-    if canales:
-        for c in canales.split(","):
-            if c.strip().isdigit():
-                channel_ids.append(int(c.strip()))
-    await add_auto_message(interaction.guild_id, palabra, resp_list, channel_ids)
-    await interaction.response.send_message(
-        f"✅ Auto-mensaje creado.\nPalabra: `{palabra}`\nRespuestas: {len(resp_list)}"
-    )
-
-@tree.command(name="auto-lista", description="Lista mensajes automáticos")
-@admin_only()
-async def auto_lista(interaction: discord.Interaction):
-    autos = await get_auto_messages(interaction.guild_id)
-    if not autos:
-        await interaction.response.send_message("No hay mensajes automáticos.")
-        return
-    text = "\n".join(f"**ID {a['id']}** — `{a['trigger']}` ({len(a['responses'])} respuestas)" for a in autos)
-    embed = discord.Embed(title="📋 Mensajes Automáticos", description=text, color=discord.Color.blue())
-    await interaction.response.send_message(embed=embed)
-
-@tree.command(name="auto-borrar", description="Borra un auto-mensaje por ID")
-@admin_only()
-async def auto_borrar(interaction: discord.Interaction, id: int):
-    await delete_auto_message(interaction.guild_id, id)
-    await interaction.response.send_message(f"✅ Auto-mensaje **{id}** eliminado.")
-
-@tree.command(name="programar-mensaje", description="Programa un mensaje")
-@admin_only()
-@app_commands.describe(canal="Canal", mensaje="Texto del mensaje", fecha="Fecha UTC: YYYY-MM-DD HH:MM")
-async def programar_mensaje(interaction: discord.Interaction, canal: discord.TextChannel, mensaje: str, fecha: str):
-    try:
-        send_at = datetime.strptime(fecha, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
-    except ValueError:
-        await interaction.response.send_message("❌ Formato: `YYYY-MM-DD HH:MM` (ej: 2026-09-20 18:30)", ephemeral=True)
-        return
-    if send_at < datetime.now(timezone.utc):
-        await interaction.response.send_message("❌ La fecha debe ser futura.", ephemeral=True)
-        return
-    await add_scheduled_message(interaction.guild_id, canal.id, mensaje, send_at.isoformat())
-    await interaction.response.send_message(f"✅ Mensaje programado para **{fecha} UTC** en {canal.mention}")
-
-# ==================== CONFIG ====================
-@tree.command(name="config-canal-levelup", description="Canal de level up")
-@admin_only()
-async def config_canal_levelup(interaction: discord.Interaction, canal: discord.TextChannel):
-    await set_levelup_channel(interaction.guild_id, canal.id)
-    await interaction.response.send_message(f"✅ Canal de level up: {canal.mention}")
-
-@tree.command(name="config-desactivar-levelup", description="Desactiva mensajes de level up")
-@admin_only()
-async def config_desactivar_levelup(interaction: discord.Interaction):
-    await set_levelup_channel(interaction.guild_id, None)
-    await interaction.response.send_message("✅ Mensajes de level up desactivados.")
-
-@tree.command(name="config-ignorar-canal", description="No ganar XP en un canal")
-@admin_only()
-async def config_ignorar_canal(interaction: discord.Interaction, canal: discord.TextChannel):
-    await add_ignored_channel(interaction.guild_id, canal.id)
-    await interaction.response.send_message(f"✅ Ya no se gana XP en {canal.mention}")
-
-@tree.command(name="config-permitir-canal", description="Permitir XP en un canal")
-@admin_only()
-async def config_permitir_canal(interaction: discord.Interaction, canal: discord.TextChannel):
-    await remove_ignored_channel(interaction.guild_id, canal.id)
-    await interaction.response.send_message(f"✅ Ahora se gana XP en {canal.mention}")
-
-@tree.command(name="config-canales-ignorados", description="Lista canales bloqueados")
-@admin_only()
-async def config_canales_ignorados(interaction: discord.Interaction):
-    channels = await get_ignored_channels(interaction.guild_id)
-    if not channels:
-        await interaction.response.send_message("No hay canales ignorados.")
-        return
-    mentions = []
-    for c in channels:
-        ch = interaction.guild.get_channel(c)
-        mentions.append(ch.mention if ch else str(c))
-    await interaction.response.send_message("**Canales ignorados:**\n" + "\n".join(mentions))
-
-@tree.command(name="config-roles-admin", description="Roles de administración")
-@admin_only()
-async def config_roles_admin(interaction: discord.Interaction, rol1: discord.Role, rol2: discord.Role = None, rol3: discord.Role = None):
-    roles = [rol1]
-    for r in [rol2, rol3]:
-        if r and r not in roles:
-            roles.append(r)
-    await set_admin_roles(interaction.guild_id, [r.id for r in roles])
-    await interaction.response.send_message("✅ Roles actualizados: " + " ".join(r.mention for r in roles))
-
-@tree.command(name="config-ver", description="Ver configuración")
-@admin_only()
-async def config_ver(interaction: discord.Interaction):
-    config = await get_guild_config(interaction.guild_id)
-    classes = await get_classes(interaction.guild_id)
-    shops = await get_shops(interaction.guild_id)
-    embed = discord.Embed(title="⚙️ Configuración", color=discord.Color.blue())
-    embed.add_field(name="Nivel máximo", value=str(config["max_level"]) if config["max_level"] else "Sin límite", inline=True)
-    embed.add_field(name="Clases", value=", ".join(classes) if classes else "Ninguna", inline=False)
-    embed.add_field(name="Tiendas", value=", ".join(n for _i, n in shops) if shops else "Ninguna", inline=False)
-    embed.set_footer(text="Creado por 《JEFP25》")
-    await interaction.response.send_message(embed=embed)
-
+# ==================== MAIN ====================
 if __name__ == "__main__":
     if not TOKEN:
-        print("❌ Falta DISCORD_TOKEN")
+        print("❌ Falta DISCORD_TOKEN en variables de entorno")
     else:
         bot.run(TOKEN)
-        
