@@ -2118,7 +2118,7 @@ async def ver_xp_cmd(interaction: discord.Interaction, pj: str):
         f"📊 **{ch['name']}** — Nivel **{ch['level']}** | XP **{ch['xp']}** | Rango **{rank_from_level(ch['level'])}**"
     )
 
-@tree.command(name="dar-dinero", description="Admin: dar dinero a un PJ")
+@tree.command(name="admin-dar-dinero", description="Admin: dar dinero a un PJ")
 @admin_only()
 @app_commands.describe(pj_id="ID del PJ", cantidad="Monedas")
 async def admin_dar_dinero(interaction: discord.Interaction, pj_id: int, cantidad: app_commands.Range[int, 1, 1_000_000_000]):
