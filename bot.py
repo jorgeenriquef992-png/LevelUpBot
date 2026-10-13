@@ -33,13 +33,13 @@ RANK_LEVELS = {"C": 10, "B": 20, "A": 30, "S": 50}
 GRADE_ORDER = {"Comun": 0, "Refinado": 1, "Superior": 2, "Magistral": 3}
 RANK_ORDER = {"C": 0, "B": 1, "A": 2, "S": 3}
 GRADE_BY_RANK = {"C": "Comun", "B": "Refinado", "A": "Superior", "S": "Magistral"}
-EFFECTS = ["Sangrado", "Quemadura", "Aturdimiento", "Sueño", "Veneno", "Congelamiento", "Parálisis"]
+EFFECTS = ["Sangrado", "Quemadura", "Aturdimiento", "SueÃ±o", "Veneno", "Congelamiento", "ParÃ¡lisis"]
 ELEMENTS = ["Fuego", "Agua", "Tierra", "Aire", "Ninguno"]
 MESA_BY_PROF = {
-    "Herrero": "Mesa de Herrería",
-    "Artífice": "Mesa de Artífice",
+    "Herrero": "Mesa de HerrerÃ­a",
+    "ArtÃ­fice": "Mesa de ArtÃ­fice",
     "Elixirista": "Mesa de Elixir",
-    "Toxicólogo": "Mesa de Toxicología",
+    "ToxicÃ³logo": "Mesa de ToxicologÃ­a",
     "Cocinero": "Mesa de Cocina",
 }
 DEFAULT_STATS = {
@@ -55,7 +55,7 @@ SAFE_OPS = {
 
 # ==================== UTILIDADES ====================
 def safe_eval(expr: str):
-    expr = expr.replace("×", "*").replace("÷", "/").replace("^", "**")
+    expr = expr.replace("Ã—", "*").replace("Ã·", "/").replace("^", "**")
     expr = re.sub(r"(\d+(?:\.\d+)?)%", r"(\1/100)", expr)
     try:
         node = ast.parse(expr, mode="eval")
@@ -74,7 +74,7 @@ def safe_eval(expr: str):
         return None
 
 def parse_codes(text: str) -> dict:
-    """Extrae códigos tipo $FUE=5 o $DAÑO=3 del texto."""
+    """Extrae cÃ³digos tipo $FUE=5 o $DAÃ‘O=3 del texto."""
     if not text:
         return {}
     found = {}
@@ -87,8 +87,8 @@ def parse_codes(text: str) -> dict:
                 found[key] = int(val)
         except ValueError:
             found[key] = val
-    # También captura $EFECTO=Sangrado sin forzar número
-    for m in re.finditer(r"\$([A-Z_]+)\s*=\s*([A-Za-zÁÉÍÓÚáéíóúñÑ_]+)", text):
+    # TambiÃ©n captura $EFECTO=Sangrado sin forzar nÃºmero
+    for m in re.finditer(r"\$([A-Z_]+)\s*=\s*([A-Za-zÃÃ‰ÃÃ“ÃšÃ¡Ã©Ã­Ã³ÃºÃ±Ã‘_]+)", text):
         key = m.group(1).upper()
         if key not in found:
             found[key] = m.group(2)
@@ -154,7 +154,8 @@ async def init_db():
                 xp INTEGER DEFAULT 0,
                 money INTEGER DEFAULT 0,
                 stats_json TEXT DEFAULT '{}',
-                alive INTEGER DEFAULT 1
+                alive INTEGER DEFAULT 1,
+                tupper_name TEXT DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS inventory (
                 character_id INTEGER NOT NULL,
@@ -235,22 +236,51 @@ async def init_db():
             );
             """
         )
+        for col_sql in [
+            "ALTER TABLE guild_config ADD COLUMN xp_channels TEXT DEFAULT '[]'",
+            "ALTER TABLE guild_config ADD COLUMN xp_categories TEXT DEFAULT '[]'",
+            "ALTER TABLE characters ADD COLUMN tupper_name TEXT DEFAULT ''",
+        ]:
+            try:
+                await db.execute(col_sql)
+            except Exception:
+                pass
         await db.commit()
 
 # ==================== GUILD / ADMIN ====================
 async def get_guild_config(guild_id: int) -> dict:
     async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute(
-            "SELECT admin_roles, xp_channel_id, max_level FROM guild_config WHERE guild_id=?",
-            (guild_id,),
-        ) as cur:
-            row = await cur.fetchone()
+        try:
+            async with db.execute(
+                "SELECT admin_roles, xp_channel_id, max_level, xp_channels, xp_categories FROM guild_config WHERE guild_id=?",
+                (guild_id,),
+            ) as cur:
+                row = await cur.fetchone()
+        except Exception:
+            async with db.execute(
+                "SELECT admin_roles, xp_channel_id, max_level FROM guild_config WHERE guild_id=?",
+                (guild_id,),
+            ) as cur:
+                r = await cur.fetchone()
+                row = (r[0], r[1], r[2], "[]", "[]") if r else None
     if not row:
-        return {"admin_roles": [], "xp_channel_id": None, "max_level": 50}
+        return {"admin_roles": [], "xp_channel_id": None, "max_level": 50, "xp_channels": [], "xp_categories": []}
+    try:
+        channels = json.loads(row[3] or "[]") if len(row) > 3 else []
+    except Exception:
+        channels = []
+    if row[1] and row[1] not in channels:
+        channels.append(row[1])
+    try:
+        categories = json.loads(row[4] or "[]") if len(row) > 4 else []
+    except Exception:
+        categories = []
     return {
         "admin_roles": json.loads(row[0] or "[]"),
         "xp_channel_id": row[1],
         "max_level": row[2] or 50,
+        "xp_channels": channels,
+        "xp_categories": categories,
     }
 
 async def set_guild_field(guild_id: int, field: str, value):
@@ -271,7 +301,7 @@ async def has_admin(interaction: discord.Interaction) -> bool:
 def admin_only():
     async def predicate(interaction: discord.Interaction):
         if not await has_admin(interaction):
-            await interaction.response.send_message("❌ No tienes permiso de admin.", ephemeral=True)
+            await interaction.response.send_message("âŒ No tienes permiso de admin.", ephemeral=True)
             return False
         return True
     return app_commands.check(predicate)
@@ -323,7 +353,7 @@ async def list_professions(guild_id: int):
         ) as cur:
             return [r[0] for r in await cur.fetchall()]
 
-# ==================== INVENTARIO / ECONOMÍA ====================
+# ==================== INVENTARIO / ECONOMÃA ====================
 async def get_inventory(char_id: int):
     async with aiosqlite.connect(DATABASE) as db:
         async with db.execute(
@@ -499,6 +529,29 @@ async def ac_user_chars(interaction: discord.Interaction, current: str):
             out.append(app_commands.Choice(name=label[:100], value=str(cid)))
     return out[:25]
 
+async def get_all_characters(guild_id: int):
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute(
+            """SELECT id, name, level, class_name, user_id FROM characters
+               WHERE guild_id=? AND alive=1 ORDER BY name""",
+            (guild_id,),
+        ) as cur:
+            return await cur.fetchall()
+
+async def ac_all_chars(interaction: discord.Interaction, current: str):
+    """Autocomplete de TODOS los PJs del servidor (filtrable por nombre)."""
+    chars = await get_all_characters(interaction.guild_id)
+    current = (current or "").lower()
+    out = []
+    for cid, name, level, cls, user_id in chars:
+        label = f"{name} Â· Nv.{level}"
+        if cls:
+            label += f" Â· {cls}"
+        label += f" Â· ID {cid}"
+        if current in name.lower() or current in label.lower() or current in str(cid):
+            out.append(app_commands.Choice(name=label[:100], value=str(cid)))
+    return out[:25]
+
 async def ac_shops(interaction: discord.Interaction, current: str):
     shops = await get_shops(interaction.guild_id)
     current = (current or "").lower()
@@ -522,7 +575,7 @@ async def ac_shop_items(interaction: discord.Interaction, current: str):
     ][:25]
 
 async def ac_inv_items(interaction: discord.Interaction, current: str):
-    pj = getattr(interaction.namespace, "pj", None)
+    pj = getattr(interaction.namespace, "pj", None) or getattr(interaction.namespace, "pj_origen", None)
     if not pj:
         return []
     try:
@@ -559,7 +612,7 @@ class CombatView(discord.ui.View):
         parts = [p for p in await get_participants(self.combat_id) if p["alive"]]
         if not parts:
             return combat, None
-        # Orden: quien inicia primero ya está en turn_index; luego por velocidad
+        # Orden: quien inicia primero ya estÃ¡ en turn_index; luego por velocidad
         idx = combat["turn_index"] % len(parts)
         # Ordenar por VEL desc manteniendo estabilidad
         parts_sorted = sorted(parts, key=lambda p: (-(json.loads(p["stats_json"]).get("VEL", 0)), p["character_id"]))
@@ -570,80 +623,80 @@ class CombatView(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         combat, actor = await self._current_actor()
         if not combat or not actor:
-            await interaction.response.send_message("Este combate ya no está activo.", ephemeral=True)
+            await interaction.response.send_message("Este combate ya no estÃ¡ activo.", ephemeral=True)
             return False
         if interaction.user.id != actor["user_id"]:
-            await interaction.response.send_message("❌ No es tu turno.", ephemeral=True)
+            await interaction.response.send_message("âŒ No es tu turno.", ephemeral=True)
             return False
         return True
 
-    @discord.ui.button(label="Atacar", style=discord.ButtonStyle.danger, emoji="⚔️")
+    @discord.ui.button(label="Atacar", style=discord.ButtonStyle.danger, emoji="âš”ï¸")
     async def atacar(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(
-            "Escribe el ataque así:\n`!ataque <id_pj_objetivo> <nombre_arma> | descripción`\n"
+            "Escribe el ataque asÃ­:\n`!ataque <id_pj_objetivo> <nombre_arma> | descripciÃ³n`\n"
             "Ejemplo: `!ataque 3 Espada de Hierro | Golpeo con fuerza`",
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Defender", style=discord.ButtonStyle.primary, emoji="🛡️")
+    @discord.ui.button(label="Defender", style=discord.ButtonStyle.primary, emoji="ðŸ›¡ï¸")
     async def defender(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(
-            "Escribe la defensa así:\n`!defensa <nombre_arma_o_escudo> | descripción`\n"
-            "O si eres tanque protegiendo a alguien:\n`!defensa <id_aliado> <arma> | descripción`",
+            "Escribe la defensa asÃ­:\n`!defensa <nombre_arma_o_escudo> | descripciÃ³n`\n"
+            "O si eres tanque protegiendo a alguien:\n`!defensa <id_aliado> <arma> | descripciÃ³n`",
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Esquivar", style=discord.ButtonStyle.secondary, emoji="💨")
+    @discord.ui.button(label="Esquivar", style=discord.ButtonStyle.secondary, emoji="ðŸ’¨")
     async def esquivar(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(
-            "Escribe: `!esquivar | descripción del esquive`",
+            "Escribe: `!esquivar | descripciÃ³n del esquive`",
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Inventario", style=discord.ButtonStyle.success, emoji="🎒")
+    @discord.ui.button(label="Inventario", style=discord.ButtonStyle.success, emoji="ðŸŽ’")
     async def inventario(self, interaction: discord.Interaction, button: discord.ui.Button):
         combat, actor = await self._current_actor()
         if not actor:
             return
         items = await get_inventory(actor["character_id"])
         if not items:
-            await interaction.response.send_message("Inventario vacío.", ephemeral=True)
+            await interaction.response.send_message("Inventario vacÃ­o.", ephemeral=True)
             return
-        text = "\n".join(f"• **{n}** x{q} ({t})" for n, q, t, *_ in items)
+        text = "\n".join(f"â€¢ **{n}** x{q} ({t})" for n, q, t, *_ in items)
         await interaction.response.send_message(
-            f"🎒 Inventario (usa `!usar-combate <item> | descripción`):\n{text}",
+            f"ðŸŽ’ Inventario (usa `!usar-combate <item> | descripciÃ³n`):\n{text}",
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Huir", style=discord.ButtonStyle.secondary, emoji="🏃")
+    @discord.ui.button(label="Huir", style=discord.ButtonStyle.secondary, emoji="ðŸƒ")
     async def huir(self, interaction: discord.Interaction, button: discord.ui.Button):
         combat, actor = await self._current_actor()
         if not combat or not actor:
             return
         if combat["combat_type"] == "amistoso":
             await update_participant(self.combat_id, actor["character_id"], alive=0, vida=0)
-            await append_log(self.combat_id, f"🏃 {actor['character_id']} huyó (amistoso).")
+            await append_log(self.combat_id, f"ðŸƒ {actor['character_id']} huyÃ³ (amistoso).")
             await interaction.response.send_message("Has huido. Combate amistoso: pierdes.")
             await check_combat_end(self.combat_id, interaction.channel)
         else:
             roll = random.randint(1, 10)
             if roll >= 8:
                 await update_participant(self.combat_id, actor["character_id"], alive=0, vida=0)
-                await append_log(self.combat_id, f"🏃 {actor['character_id']} huyó (dado {roll}).")
-                await interaction.response.send_message(f"Dado: **{roll}** — ¡Lograste huir!")
+                await append_log(self.combat_id, f"ðŸƒ {actor['character_id']} huyÃ³ (dado {roll}).")
+                await interaction.response.send_message(f"Dado: **{roll}** â€” Â¡Lograste huir!")
                 await check_combat_end(self.combat_id, interaction.channel)
             else:
                 await update_participant(self.combat_id, actor["character_id"], alive=0, vida=0)
-                await append_log(self.combat_id, f"💀 {actor['character_id']} falló huida (dado {roll}) y cayó.")
-                await interaction.response.send_message(f"Dado: **{roll}** — Fallaste. Tu vida cae a 0.")
+                await append_log(self.combat_id, f"ðŸ’€ {actor['character_id']} fallÃ³ huida (dado {roll}) y cayÃ³.")
+                await interaction.response.send_message(f"Dado: **{roll}** â€” Fallaste. Tu vida cae a 0.")
                 await handle_downed(self.combat_id, actor, interaction.channel)
 
-    @discord.ui.button(label="Ver log", style=discord.ButtonStyle.secondary, emoji="📜", row=1)
+    @discord.ui.button(label="Ver log", style=discord.ButtonStyle.secondary, emoji="ðŸ“œ", row=1)
     async def ver_log(self, interaction: discord.Interaction, button: discord.ui.Button):
         combat = await get_combat(self.combat_id)
         log = json.loads(combat.get("log_json") or "[]")
-        text = "\n".join(log[-20:]) if log else "Sin acciones aún."
-        await interaction.response.send_message(f"📜 **Log del combate**\n{text}", ephemeral=True)
+        text = "\n".join(log[-20:]) if log else "Sin acciones aÃºn."
+        await interaction.response.send_message(f"ðŸ“œ **Log del combate**\n{text}", ephemeral=True)
 
 async def advance_turn(combat_id: int, channel):
     combat = await get_combat(combat_id)
@@ -660,8 +713,8 @@ async def advance_turn(combat_id: int, channel):
     ch = await get_character(actor["character_id"])
     name = ch["name"] if ch else str(actor["character_id"])
     embed = discord.Embed(
-        title="⚔️ Turno de combate",
-        description=f"Le toca a <@{actor['user_id']}> — **{name}**\nVida: **{actor['vida']}** | Maná: **{actor['mana']}**",
+        title="âš”ï¸ Turno de combate",
+        description=f"Le toca a <@{actor['user_id']}> â€” **{name}**\nVida: **{actor['vida']}** | ManÃ¡: **{actor['mana']}**",
         color=discord.Color.orange(),
     )
     await channel.send(content=f"<@{actor['user_id']}>", embed=embed, view=CombatView(combat_id))
@@ -672,10 +725,10 @@ async def handle_downed(combat_id: int, actor: dict, channel):
     if not combat or not ch:
         return
     if combat["combat_type"] == "amistoso":
-        await channel.send(f"💔 **{ch['name']}** ha caído (amistoso). No se elimina el PJ.")
+        await channel.send(f"ðŸ’” **{ch['name']}** ha caÃ­do (amistoso). No se elimina el PJ.")
         await check_combat_end(combat_id, channel)
         return
-    # Buscar ítem revivir
+    # Buscar Ã­tem revivir
     items = await get_inventory(actor["character_id"])
     revive_item = None
     for n, q, t, data_json, img, desc in items:
@@ -686,12 +739,12 @@ async def handle_downed(combat_id: int, actor: dict, channel):
     if revive_item:
         view = ReviveView(combat_id, actor["character_id"], revive_item)
         await channel.send(
-            f"💀 **{ch['name']}** cayó a muerte. ¿Usar **{revive_item}** para revivir?",
+            f"ðŸ’€ **{ch['name']}** cayÃ³ a muerte. Â¿Usar **{revive_item}** para revivir?",
             view=view,
         )
     else:
         await delete_character(actor["character_id"])
-        await channel.send(f"💀 **{ch['name']}** ha muerto y fue eliminado. Cupo liberado.")
+        await channel.send(f"ðŸ’€ **{ch['name']}** ha muerto y fue eliminado. Cupo liberado.")
         await check_combat_end(combat_id, channel)
 
 async def delete_character(char_id: int):
@@ -709,11 +762,11 @@ async def check_combat_end(combat_id: int, channel):
             await db.commit()
         if len(alive) == 1:
             ch = await get_character(alive[0]["character_id"])
-            await channel.send(f"🏆 Combate terminado. Gana **{ch['name'] if ch else 'alguien'}**.")
+            await channel.send(f"ðŸ† Combate terminado. Gana **{ch['name'] if ch else 'alguien'}**.")
         else:
             await channel.send(" Combate terminado. Nadie queda en pie.")
         return
-    # Grupo: preguntar si continuar cuando alguien cae — simplificado: auto-continúa
+    # Grupo: preguntar si continuar cuando alguien cae â€” simplificado: auto-continÃºa
     await advance_turn(combat_id, channel)
 
 class ReviveView(discord.ui.View):
@@ -723,7 +776,7 @@ class ReviveView(discord.ui.View):
         self.char_id = char_id
         self.item_name = item_name
 
-    @discord.ui.button(label="Revivir", style=discord.ButtonStyle.success, emoji="✨")
+    @discord.ui.button(label="Revivir", style=discord.ButtonStyle.success, emoji="âœ¨")
     async def revivir(self, interaction: discord.Interaction, button: discord.ui.Button):
         ch = await get_character(self.char_id)
         if not ch or interaction.user.id != ch["user_id"]:
@@ -731,17 +784,17 @@ class ReviveView(discord.ui.View):
             return
         item = await get_item(self.char_id, self.item_name)
         if not item:
-            await interaction.response.send_message("Ya no tienes ese ítem.", ephemeral=True)
+            await interaction.response.send_message("Ya no tienes ese Ã­tem.", ephemeral=True)
             return
         await add_item(self.char_id, self.item_name, -1)
         stats = json.loads(ch["stats_json"] or "{}")
         vida = stats.get("VIDA_MAX", 20)
         await update_participant(self.combat_id, self.char_id, alive=1, vida=vida)
-        await append_log(self.combat_id, f"✨ {ch['name']} revivió con {self.item_name}.")
+        await append_log(self.combat_id, f"âœ¨ {ch['name']} reviviÃ³ con {self.item_name}.")
         async with aiosqlite.connect(DATABASE) as db:
             await db.execute("UPDATE combats SET status='ended' WHERE id=?", (self.combat_id,))
             await db.commit()
-        await interaction.response.send_message(f"✨ **{ch['name']}** revive. Combate finalizado.")
+        await interaction.response.send_message(f"âœ¨ **{ch['name']}** revive. Combate finalizado.")
         self.stop()
 
     @discord.ui.button(label="No revivir", style=discord.ButtonStyle.danger)
@@ -751,7 +804,7 @@ class ReviveView(discord.ui.View):
             await interaction.response.send_message("No es tu personaje.", ephemeral=True)
             return
         await delete_character(self.char_id)
-        await interaction.response.send_message(f"💀 **{ch['name']}** eliminado.")
+        await interaction.response.send_message(f"ðŸ’€ **{ch['name']}** eliminado.")
         await check_combat_end(self.combat_id, interaction.channel)
         self.stop()
 
@@ -761,7 +814,7 @@ class MesaView(discord.ui.View):
         self.char_id = char_id
         self.profession = profession
 
-    @discord.ui.button(label="Craftear", style=discord.ButtonStyle.primary, emoji="🛠️")
+    @discord.ui.button(label="Craftear", style=discord.ButtonStyle.primary, emoji="ðŸ› ï¸")
     async def craftear(self, interaction: discord.Interaction, button: discord.ui.Button):
         ch = await get_character(self.char_id)
         if not ch or ch["user_id"] != interaction.user.id:
@@ -779,19 +832,19 @@ class MesaView(discord.ui.View):
             mats = json.loads(r[7] or "{}")
             mat_txt = ", ".join(f"{k}x{v}" for k, v in mats.items())
             magic = f" | Magia: {r[9]}" if r[8] else ""
-            lines.append(f"**ID {r[0]}** — {r[1]} [{r[3]}] → {r[4]} ({mat_txt}){magic}")
+            lines.append(f"**ID {r[0]}** â€” {r[1]} [{r[3]}] â†’ {r[4]} ({mat_txt}){magic}")
         await interaction.response.send_message(
-            "🛠️ Recetas (usa `!craft <id_receta> <nombre_opcional>`):\n" + "\n".join(lines),
+            "ðŸ› ï¸ Recetas (usa `!craft <id_receta> <nombre_opcional>`):\n" + "\n".join(lines),
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Reparar", style=discord.ButtonStyle.secondary, emoji="🔧")
+    @discord.ui.button(label="Reparar", style=discord.ButtonStyle.secondary, emoji="ðŸ”§")
     async def reparar(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.profession != "Herrero":
             await interaction.response.send_message("Solo herreros reparan armas/armaduras.", ephemeral=True)
             return
         await interaction.response.send_message(
-            "🔧 Escribe: `!reparar-arma <nombre_arma>`\n"
+            "ðŸ”§ Escribe: `!reparar-arma <nombre_arma>`\n"
             "Necesitas la mitad de materiales de la receta original y el grado adecuado.",
             ephemeral=True,
         )
@@ -802,16 +855,26 @@ async def on_ready():
     await init_db()
     try:
         synced = await tree.sync()
-        print(f"✅ Conectado como {bot.user} | {len(synced)} comandos")
+        print(f"âœ… Conectado como {bot.user} | {len(synced)} comandos")
     except Exception as e:
         print("Error sync:", e)
 
 @bot.event
 async def on_message(message: discord.Message):
-    if not message.guild or not message.content:
+    if not message.guild:
         return
     # Nunca procesar mensajes del propio bot (evita bucles de dados)
     if bot.user and message.author.id == bot.user.id:
+        return
+
+    # MenciÃ³n al bot
+    if bot.user and bot.user.mentioned_in(message) and not message.mention_everyone:
+        await message.reply("Estoy aquÃ­ âœ…", mention_author=False)
+        # Si solo lo mencionaron, no seguir procesando
+        if message.content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip() == "":
+            return
+
+    if not message.content:
         return
 
     content = message.content.strip()
@@ -819,7 +882,7 @@ async def on_message(message: discord.Message):
     clean = content.replace(" ", "")
 
     # Calculadora
-    if re.match(r"^[\d\s\+\-\*\/\×\÷\^\(\)\.\%]+$", clean) and any(op in content for op in "+-*/×÷^%"):
+    if re.match(r"^[\d\s\+\-\*\/\Ã—\Ã·\^\(\)\.\%]+$", clean) and any(op in content for op in "+-*/Ã—Ã·^%"):
         result = safe_eval(content)
         if result is not None:
             if isinstance(result, float) and result.is_integer():
@@ -836,9 +899,9 @@ async def on_message(message: discord.Message):
             results = [random.randint(1, sides) for _ in range(num_dice)]
             total = sum(results)
             if num_dice == 1:
-                text = f"🎲 **{num_dice}d{sides}** = **{results[0]}**"
+                text = f"ðŸŽ² **{num_dice}d{sides}** = **{results[0]}**"
             else:
-                text = f"🎲 **{num_dice}d{sides}** → {', '.join(map(str, results))}\n**Total: {total}**"
+                text = f"ðŸŽ² **{num_dice}d{sides}** â†’ {', '.join(map(str, results))}\n**Total: {total}**"
             await message.reply(text, mention_author=False)
             return
 
@@ -846,21 +909,36 @@ async def on_message(message: discord.Message):
     if content_lower.startswith("elige:"):
         options = [o.strip() for o in content[6:].split(",") if o.strip()]
         if len(options) >= 2:
-            await message.reply(f"🎯 **He elegido:** {random.choice(options)}", mention_author=False)
+            await message.reply(f"ðŸŽ¯ **He elegido:** {random.choice(options)}", mention_author=False)
             return
 
-    # Prefijo combate / crafteo rápido
+    # Prefijo combate / crafteo rÃ¡pido
     if not message.author.bot:
         await handle_prefix_commands(message)
 
-    # XP por mensaje (si hay canal configurado y es ese canal)
-    if not message.author.bot:
-        cfg = await get_guild_config(message.guild.id)
-        if cfg["xp_channel_id"] and message.channel.id == cfg["xp_channel_id"]:
-            chars = await get_user_characters(message.guild.id, message.author.id)
-            if chars:
-                # XP al primer PJ por defecto
-                await grant_xp(chars[0][0], random.randint(5, 15), message.channel)
+    # XP solo con tupper vinculado en canal/categorÃ­a XP
+    cfg = await get_guild_config(message.guild.id)
+    xp_channels = cfg.get("xp_channels") or []
+    xp_categories = cfg.get("xp_categories") or []
+    in_xp_place = message.channel.id in xp_channels
+    cat_id = getattr(message.channel, "category_id", None)
+    if cat_id and cat_id in xp_categories:
+        in_xp_place = True
+    if in_xp_place and message.webhook_id:
+        tupper = (message.author.display_name or message.author.name or "").strip()
+        if tupper:
+            char_id = await find_char_by_tupper(message.guild.id, tupper)
+            if char_id:
+                await grant_xp(char_id, random.randint(5, 15), message.channel)
+
+async def find_char_by_tupper(guild_id: int, tupper_name: str):
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute(
+            "SELECT id FROM characters WHERE guild_id=? AND alive=1 AND LOWER(tupper_name)=LOWER(?)",
+            (guild_id, tupper_name.strip()),
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else None
 
 async def grant_xp(char_id: int, amount: int, channel=None):
     ch = await get_character(char_id)
@@ -890,13 +968,13 @@ async def grant_xp(char_id: int, amount: int, channel=None):
                     (json.dumps(stats), char_id),
                 )
                 await db.commit()
-        text = f"🎉 **{ch['name']}** subió al nivel **{new_level}**!"
+        text = f"ðŸŽ‰ **{ch['name']}** subiÃ³ al nivel **{new_level}**!"
         if rewards and rewards[0]:
             rw = json.loads(rewards[0] or "[]")
             if rw:
-                text += "\nDesbloqueos:\n" + "\n".join(f"• {x}" for x in rw)
+                text += "\nDesbloqueos:\n" + "\n".join(f"â€¢ {x}" for x in rw)
         if new_level == PROFESSION_LEVEL:
-            text += "\n🛠️ ¡Puedes elegir profesión con `/profesion`!"
+            text += "\nðŸ› ï¸ Â¡Puedes elegir profesiÃ³n con `/profesion`!"
         await channel.send(text)
 
 async def get_level_reward(guild_id: int, level: int):
@@ -916,7 +994,7 @@ async def handle_prefix_commands(message: discord.Message):
         try:
             rid = int(parts[0])
         except ValueError:
-            await message.reply("ID de receta inválido.")
+            await message.reply("ID de receta invÃ¡lido.")
             return
         custom_name = parts[1] if len(parts) > 1 else None
         await do_craft(message, rid, custom_name)
@@ -937,7 +1015,7 @@ async def do_craft(message, recipe_id: int, custom_name: str = None):
     if not chars:
         await message.reply("No tienes personajes.")
         return
-    # Usar primer PJ con profesión compatible; mejor: buscar quién tiene la mesa
+    # Usar primer PJ con profesiÃ³n compatible; mejor: buscar quiÃ©n tiene la mesa
     recipe = await get_recipe(recipe_id)
     if not recipe:
         await message.reply("Receta no existe.")
@@ -973,7 +1051,7 @@ async def do_craft(message, recipe_id: int, custom_name: str = None):
         char["id"], item_name, 1, recipe[5], result_data,
         recipe[10] or "", f"Creado por {char['name']}"
     )
-    await message.reply(f"✅ **{char['name']}** crafteó **{item_name}** [{recipe[3]}].")
+    await message.reply(f"âœ… **{char['name']}** crafteÃ³ **{item_name}** [{recipe[3]}].")
 
 async def do_repair(message, arma_name: str):
     chars = await get_user_characters(message.guild.id, message.author.id)
@@ -983,7 +1061,7 @@ async def do_repair(message, arma_name: str):
             herrero = await get_character(cid)
             break
     if not herrero:
-        await message.reply("Ningún PJ tuyo es Herrero.")
+        await message.reply("NingÃºn PJ tuyo es Herrero.")
         return
     # Buscar arma en inventarios del usuario
     target_char = None
@@ -1015,7 +1093,7 @@ async def do_repair(message, arma_name: str):
             return
     for mat, need in half.items():
         await add_item(herrero["id"], mat, -need)
-    # Restaurar durabilidad máxima si existe
+    # Restaurar durabilidad mÃ¡xima si existe
     if "DUR_MAX" in data:
         data["DUR"] = data["DUR_MAX"]
     elif "DUR" in data:
@@ -1026,13 +1104,13 @@ async def do_repair(message, arma_name: str):
             (json.dumps(data), target_char["id"], arma_name),
         )
         await db.commit()
-    await message.reply(f"🔧 **{arma_name}** reparada por **{herrero['name']}**.")
+    await message.reply(f"ðŸ”§ **{arma_name}** reparada por **{herrero['name']}**.")
 
 async def do_attack(message):
     # !ataque <obj_id> <arma> | descripcion
     body = message.content[8:].strip()
     if "|" not in body:
-        await message.reply("Formato: `!ataque <id_objetivo> <arma> | descripción`")
+        await message.reply("Formato: `!ataque <id_objetivo> <arma> | descripciÃ³n`")
         return
     left, desc = body.split("|", 1)
     left_parts = left.strip().split(maxsplit=1)
@@ -1042,7 +1120,7 @@ async def do_attack(message):
     try:
         target_id = int(left_parts[0])
     except ValueError:
-        await message.reply("ID de objetivo inválido.")
+        await message.reply("ID de objetivo invÃ¡lido.")
         return
     arma = left_parts[1].strip()
     desc = desc.strip()
@@ -1056,14 +1134,14 @@ async def do_attack(message):
             combat_id = cid_combat
             break
     if not actor_ch or not combat_id:
-        await message.reply("No estás en combate activo.")
+        await message.reply("No estÃ¡s en combate activo.")
         return
     combat = await get_combat(combat_id)
     parts = await get_participants(combat_id)
     actor_p = next((p for p in parts if p["character_id"] == actor_ch["id"]), None)
     target_p = next((p for p in parts if p["character_id"] == target_id and p["alive"]), None)
     if not actor_p or not actor_p["alive"]:
-        await message.reply("Tu PJ no está activo en este combate.")
+        await message.reply("Tu PJ no estÃ¡ activo en este combate.")
         return
     # Verificar turno
     view = CombatView(combat_id)
@@ -1072,24 +1150,24 @@ async def do_attack(message):
         await message.reply("No es tu turno.")
         return
     if not target_p:
-        await message.reply("Objetivo inválido.")
+        await message.reply("Objetivo invÃ¡lido.")
         return
     item = await get_item(actor_ch["id"], arma)
     if not item:
         await message.reply("No tienes esa arma.")
         return
     data = json.loads(item[3] or "{}")
-    dmg = int(data.get("DAÑO") or data.get("PODER") or 1)
+    dmg = int(data.get("DAÃ‘O") or data.get("PODER") or 1)
     mana_cost = int(data.get("MANA_COST") or 0)
     if mana_cost and actor_p["mana"] < mana_cost:
-        await message.reply("No tienes maná suficiente.")
+        await message.reply("No tienes manÃ¡ suficiente.")
         return
     if mana_cost:
         await update_participant(combat_id, actor_ch["id"], mana=actor_p["mana"] - mana_cost)
 
     actor_stats = json.loads(actor_p["stats_json"] or "{}")
     target_stats = json.loads(target_p["stats_json"] or "{}")
-    # ¿Está defendiendo alguien a este objetivo?
+    # Â¿EstÃ¡ defendiendo alguien a este objetivo?
     defender = next(
         (p for p in parts if p["alive"] and p.get("defending_target") == target_id),
         None,
@@ -1100,12 +1178,12 @@ async def do_attack(message):
         applied_to = defender
         note = " (interceptado por tanque)"
         def_ch = await get_character(defender["character_id"])
-        # daño a arma del defensor si tiene pending defense weapon en stats temp — simplificado a vida
+        # daÃ±o a arma del defensor si tiene pending defense weapon en stats temp â€” simplificado a vida
         new_hp = max(0, applied_to["vida"] - dmg)
         await update_participant(combat_id, applied_to["character_id"], vida=new_hp, alive=1 if new_hp > 0 else 0)
-        await append_log(combat_id, f"⚔️ {actor_ch['name']} ataca a {target_id} con {arma}: {dmg} dmg{note}. {desc}")
+        await append_log(combat_id, f"âš”ï¸ {actor_ch['name']} ataca a {target_id} con {arma}: {dmg} dmg{note}. {desc}")
         await message.channel.send(
-            f"⚔️ **{actor_ch['name']}** ataca con **{arma}** → {dmg} daño{note}\n_{desc}_"
+            f"âš”ï¸ **{actor_ch['name']}** ataca con **{arma}** â†’ {dmg} daÃ±o{note}\n_{desc}_"
         )
         if new_hp <= 0:
             await handle_downed(combat_id, applied_to, message.channel)
@@ -1113,7 +1191,7 @@ async def do_attack(message):
             await advance_turn(combat_id, message.channel)
         return
 
-    # Esquiva se resolvió en turno previo si marcó dodge — simplificado: comparar VEL si target marcó esquivar en data
+    # Esquiva se resolviÃ³ en turno previo si marcÃ³ dodge â€” simplificado: comparar VEL si target marcÃ³ esquivar en data
     # Impacto directo
     efecto = data.get("EFECTO")
     new_hp = max(0, target_p["vida"] - dmg)
@@ -1128,10 +1206,10 @@ async def do_attack(message):
         effects_json=json.dumps(effects),
     )
     tch = await get_character(target_id)
-    await append_log(combat_id, f"⚔️ {actor_ch['name']} → {tch['name'] if tch else target_id} con {arma}: {dmg} dmg. {desc}")
+    await append_log(combat_id, f"âš”ï¸ {actor_ch['name']} â†’ {tch['name'] if tch else target_id} con {arma}: {dmg} dmg. {desc}")
     await message.channel.send(
-        f"⚔️ **{actor_ch['name']}** ataca a **{tch['name'] if tch else target_id}** con **{arma}**\n"
-        f"Daño: **{dmg}** | Vida restante: **{new_hp}**\n_{desc}_"
+        f"âš”ï¸ **{actor_ch['name']}** ataca a **{tch['name'] if tch else target_id}** con **{arma}**\n"
+        f"DaÃ±o: **{dmg}** | Vida restante: **{new_hp}**\n_{desc}_"
     )
     if new_hp <= 0:
         await handle_downed(combat_id, target_p, message.channel)
@@ -1141,7 +1219,7 @@ async def do_attack(message):
 async def do_defend(message):
     body = message.content[9:].strip()
     if "|" not in body:
-        await message.reply("Formato: `!defensa <arma> | descripción` o `!defensa <id_aliado> <arma> | desc`")
+        await message.reply("Formato: `!defensa <arma> | descripciÃ³n` o `!defensa <id_aliado> <arma> | desc`")
         return
     left, desc = body.split("|", 1)
     parts_l = left.strip().split()
@@ -1155,7 +1233,7 @@ async def do_defend(message):
             combat_id = c
             break
     if not actor_ch:
-        await message.reply("No estás en combate.")
+        await message.reply("No estÃ¡s en combate.")
         return
     view = CombatView(combat_id)
     _, current = await view._current_actor()
@@ -1168,8 +1246,8 @@ async def do_defend(message):
         protect_id = int(parts_l[0])
         arma = " ".join(parts_l[1:]) if len(parts_l) > 1 else ""
     await update_participant(combat_id, actor_ch["id"], defending_target=protect_id)
-    await append_log(combat_id, f"🛡️ {actor_ch['name']} defiende a {protect_id} con {arma}. {desc.strip()}")
-    await message.channel.send(f"🛡️ **{actor_ch['name']}** se prepara para defender.\n_{desc.strip()}_")
+    await append_log(combat_id, f"ðŸ›¡ï¸ {actor_ch['name']} defiende a {protect_id} con {arma}. {desc.strip()}")
+    await message.channel.send(f"ðŸ›¡ï¸ **{actor_ch['name']}** se prepara para defender.\n_{desc.strip()}_")
     await advance_turn(combat_id, message.channel)
 
 async def do_dodge(message):
@@ -1186,26 +1264,26 @@ async def do_dodge(message):
             combat_id = c
             break
     if not actor_ch:
-        await message.reply("No estás en combate.")
+        await message.reply("No estÃ¡s en combate.")
         return
     view = CombatView(combat_id)
     _, current = await view._current_actor()
     if not current or current["character_id"] != actor_ch["id"]:
         await message.reply("No es tu turno.")
         return
-    # Marcar alta velocidad temporal como intención de esquivar: guardamos flag en effects
+    # Marcar alta velocidad temporal como intenciÃ³n de esquivar: guardamos flag en effects
     effects = json.loads(current["effects_json"] or "[]")
     effects = [e for e in effects if e.get("name") != "ESQUIVANDO"]
     effects.append({"name": "ESQUIVANDO", "turns": 1})
     await update_participant(combat_id, actor_ch["id"], effects_json=json.dumps(effects))
-    await append_log(combat_id, f"💨 {actor_ch['name']} intenta esquivar. {desc}")
-    await message.channel.send(f"💨 **{actor_ch['name']}** se prepara para esquivar.\n_{desc}_")
+    await append_log(combat_id, f"ðŸ’¨ {actor_ch['name']} intenta esquivar. {desc}")
+    await message.channel.send(f"ðŸ’¨ **{actor_ch['name']}** se prepara para esquivar.\n_{desc}_")
     await advance_turn(combat_id, message.channel)
 
 async def do_combat_use(message):
     body = message.content[14:].strip()
     if "|" not in body:
-        await message.reply("Formato: `!usar-combate <item> | descripción`")
+        await message.reply("Formato: `!usar-combate <item> | descripciÃ³n`")
         return
     item_name, desc = body.split("|", 1)
     item_name = item_name.strip()
@@ -1220,7 +1298,7 @@ async def do_combat_use(message):
             combat_id = c
             break
     if not actor_ch:
-        await message.reply("No estás en combate.")
+        await message.reply("No estÃ¡s en combate.")
         return
     view = CombatView(combat_id)
     _, current = await view._current_actor()
@@ -1229,72 +1307,72 @@ async def do_combat_use(message):
         return
     item = await get_item(actor_ch["id"], item_name)
     if not item:
-        await message.reply("No tienes ese ítem.")
+        await message.reply("No tienes ese Ã­tem.")
         return
     data = json.loads(item[3] or "{}")
     item_type = item[2]
-    # Canciones y mesas no se gastan; pociones sí
-    consumible = item_type.lower() in ("poción", "pocion", "elixir", "veneno", "comida")
+    # Canciones y mesas no se gastan; pociones sÃ­
+    consumible = item_type.lower() in ("pociÃ³n", "pocion", "elixir", "veneno", "comida")
     if data.get("REVIVIR"):
         consumible = True
     if consumible:
         await add_item(actor_ch["id"], item_name, -1)
-    # Efecto simple de curación si tiene $VIDA en data como heal
+    # Efecto simple de curaciÃ³n si tiene $VIDA en data como heal
     heal = int(data.get("CURA") or 0)
     if heal:
         new_hp = current["vida"] + heal
         await update_participant(combat_id, actor_ch["id"], vida=new_hp)
-    await append_log(combat_id, f"🎒 {actor_ch['name']} usa {item_name}. {desc}")
-    await message.channel.send(f"🎒 **{actor_ch['name']}** usa **{item_name}**\n_{desc}_")
+    await append_log(combat_id, f"ðŸŽ’ {actor_ch['name']} usa {item_name}. {desc}")
+    await message.channel.send(f"ðŸŽ’ **{actor_ch['name']}** usa **{item_name}**\n_{desc}_")
     await advance_turn(combat_id, message.channel)
 
 # ==================== COMANDOS SLASH ====================
 @tree.command(name="help", description="Lista de comandos del bot RPG")
 async def help_cmd(interaction: discord.Interaction):
-    embed = discord.Embed(title="📖 Comandos RPG", color=discord.Color.blurple())
+    embed = discord.Embed(title="ðŸ“– Comandos RPG", color=discord.Color.blurple())
     embed.add_field(
-        name="👤 Personajes",
+        name="ðŸ‘¤ Personajes",
         value="`/crear` `/borrar-pj` `/pjs` `/perfil` `/editar-pj` `/profesion`",
         inline=False,
     )
     embed.add_field(
-        name="💰 Inventario",
+        name="ðŸ’° Inventario",
         value="`/dinero` `/inv` `/dar-item` `/dar-dinero` `/usar`",
         inline=False,
     )
     embed.add_field(
-        name="🛒 Tienda",
+        name="ðŸ›’ Tienda",
         value="`/tiendas` `/ver-tienda` `/comprar`",
         inline=False,
     )
     embed.add_field(
-        name="🛠️ Crafteo",
-        value="`/recetas` — Usa la **mesa** del inventario con `/usar`",
+        name="ðŸ› ï¸ Crafteo",
+        value="`/recetas` â€” Usa la **mesa** del inventario con `/usar`",
         inline=False,
     )
     embed.add_field(
-        name="⚔️ Combate",
+        name="âš”ï¸ Combate",
         value="`/duelo` `/combate` `/log`\nBotones: Atacar, Defender, Esquivar, Inventario, Huir",
         inline=False,
     )
     embed.add_field(
-        name="🎲 Utilidades",
-        value="`1d20` · `Elige: a, b` · `1+2` · `/embed`",
+        name="ðŸŽ² Utilidades",
+        value="`1d20` Â· `Elige: a, b` Â· `1+2` Â· `/embed`",
         inline=False,
     )
     embed.add_field(
-        name="🛡️ Admin",
-        value="`/crear-clase` `/crear-profesion` `/crear-tienda` `/item-tienda` `/crear-material` `/crear-receta` `/craftear` `/reparar` `/dar-xp` `/quitar-xp` `/dar-dinero` `/quitar-dinero` `/config-nivel` `/reward-nivel` `/canal-xp` `/roles-admin` `/fin-combate`",
+        name="ðŸ›¡ï¸ Admin",
+        value="`/crear-clase` `/crear-profesion` `/crear-tienda` `/item-tienda` `/crear-material` `/crear-receta` `/craftear` `/reparar` `/dar-xp` `/quitar-xp` `/admin-dar-dinero` `/quitar-dinero` `/config-nivel` `/reward-nivel` `/canal-xp` `/categoria-xp` `/vincular-tupper` `/roles-admin` `/fin-combate`",
         inline=False,
     )
-    embed.set_footer(text="Creado por 《JEFP25》")
+    embed.set_footer(text="Creado por ã€ŠJEFP25ã€‹")
     await interaction.response.send_message(embed=embed)
 
-@tree.command(name="crear", description="Crea un personaje (máx. 3)")
+@tree.command(name="crear", description="Crea un personaje (mÃ¡x. 3)")
 @app_commands.describe(
     nombre="Nombre del personaje",
     clase="Clase del personaje",
-    descripcion="Descripción / historia",
+    descripcion="DescripciÃ³n / historia",
     imagen="URL de imagen",
     color="Color hex sin # (ej: FF5500)",
 )
@@ -1308,17 +1386,25 @@ async def crear_pj(
     color: str = "5865F2",
 ):
     if await count_characters(interaction.guild_id, interaction.user.id) >= MAX_PJ:
-        await interaction.response.send_message("❌ Ya tienes 3 personajes. Borra uno primero.", ephemeral=True)
+        await interaction.response.send_message("âŒ Ya tienes 3 personajes. Borra uno primero.", ephemeral=True)
         return
     cls = await get_class(interaction.guild_id, clase)
     if not cls:
-        await interaction.response.send_message("❌ Esa clase no existe. Un admin debe crearla.", ephemeral=True)
+        await interaction.response.send_message("âŒ Esa clase no existe. Un admin debe crearla.", ephemeral=True)
         return
+    # Stats de la clase (prioridad: stats_json guardado > cÃ³digos en descripciÃ³n > defaults)
     stats = dict(DEFAULT_STATS)
+    try:
+        class_stats = json.loads(cls[2] or "{}")
+        if isinstance(class_stats, dict):
+            stats.update(class_stats)
+    except Exception:
+        pass
     stats.update(parse_codes(cls[1] or ""))
-    stats.update(json.loads(cls[2] or "{}"))
-    stats["VIDA"] = stats.get("VIDA_MAX", stats.get("VIDA", 20))
-    stats["MANA"] = stats.get("MANA_MAX", stats.get("MANA", 10))
+    stats["VIDA_MAX"] = int(stats.get("VIDA_MAX", stats.get("VIDA", 20)))
+    stats["VIDA"] = stats["VIDA_MAX"]
+    stats["MANA_MAX"] = int(stats.get("MANA_MAX", stats.get("MANA", 10)))
+    stats["MANA"] = stats["MANA_MAX"]
     try:
         color_val = int(color.replace("#", ""), 16)
     except Exception:
@@ -1336,8 +1422,8 @@ async def crear_pj(
         await db.commit()
         char_id = cur.lastrowid
     embed = discord.Embed(
-        title=f"✨ Personaje creado: {nombre}",
-        description=descripcion or "Sin descripción",
+        title=f"âœ¨ Personaje creado: {nombre}",
+        description=descripcion or "Sin descripciÃ³n",
         color=color_val,
     )
     embed.add_field(name="Clase", value=clase, inline=True)
@@ -1359,7 +1445,7 @@ async def borrar_pj(interaction: discord.Interaction, pj: str):
     try:
         char_id = int(pj)
     except ValueError:
-        await interaction.response.send_message("PJ inválido.", ephemeral=True)
+        await interaction.response.send_message("PJ invÃ¡lido.", ephemeral=True)
         return
     ch = await get_character(char_id)
     if not ch or ch["user_id"] != interaction.user.id or ch["guild_id"] != interaction.guild_id:
@@ -1369,7 +1455,7 @@ async def borrar_pj(interaction: discord.Interaction, pj: str):
         await interaction.response.send_message("No puedes borrar un PJ en combate.", ephemeral=True)
         return
     await delete_character(char_id)
-    await interaction.response.send_message(f"🗑️ Personaje **{ch['name']}** eliminado.")
+    await interaction.response.send_message(f"ðŸ—‘ï¸ Personaje **{ch['name']}** eliminado.")
 
 @tree.command(name="pjs", description="Lista tus personajes")
 async def pjs_cmd(interaction: discord.Interaction):
@@ -1378,11 +1464,11 @@ async def pjs_cmd(interaction: discord.Interaction):
         await interaction.response.send_message("No tienes personajes. Usa `/crear`.")
         return
     lines = [
-        f"**{name}** — Nv.{level} | {cls or '—'} | {prof or 'Sin profesión'} (ID `{cid}`)"
+        f"**{name}** â€” Nv.{level} | {cls or 'â€”'} | {prof or 'Sin profesiÃ³n'} (ID `{cid}`)"
         for cid, name, level, cls, prof in chars
     ]
     embed = discord.Embed(
-        title=f"👥 Tus personajes ({len(chars)}/{MAX_PJ})",
+        title=f"ðŸ‘¥ Tus personajes ({len(chars)}/{MAX_PJ})",
         description="\n".join(lines),
         color=discord.Color.green(),
     )
@@ -1395,7 +1481,7 @@ async def perfil(interaction: discord.Interaction, pj: str):
     try:
         char_id = int(pj)
     except ValueError:
-        await interaction.response.send_message("PJ inválido.", ephemeral=True)
+        await interaction.response.send_message("PJ invÃ¡lido.", ephemeral=True)
         return
     ch = await get_character(char_id)
     if not ch or ch["guild_id"] != interaction.guild_id:
@@ -1403,15 +1489,15 @@ async def perfil(interaction: discord.Interaction, pj: str):
         return
     stats = json.loads(ch["stats_json"] or "{}")
     embed = discord.Embed(
-        title=f"👤 {ch['name']}",
-        description=ch["description"] or "Sin descripción",
+        title=f"ðŸ‘¤ {ch['name']}",
+        description=ch["description"] or "Sin descripciÃ³n",
         color=ch["color"] or 0x5865F2,
     )
-    embed.add_field(name="Clase", value=ch["class_name"] or "—", inline=True)
-    embed.add_field(name="Profesión", value=ch["profession"] or "—", inline=True)
+    embed.add_field(name="Clase", value=ch["class_name"] or "â€”", inline=True)
+    embed.add_field(name="ProfesiÃ³n", value=ch["profession"] or "â€”", inline=True)
     embed.add_field(name="Nivel", value=f"{ch['level']} ({rank_from_level(ch['level'])})", inline=True)
     embed.add_field(name="XP", value=str(ch["xp"]), inline=True)
-    embed.add_field(name="💰 Dinero", value=f"{ch['money']:,}", inline=True)
+    embed.add_field(name="ðŸ’° Dinero", value=f"{ch['money']:,}", inline=True)
     embed.add_field(
         name="Stats",
         value="\n".join(
@@ -1423,11 +1509,11 @@ async def perfil(interaction: discord.Interaction, pj: str):
     )
     if ch["image_url"]:
         embed.set_thumbnail(url=ch["image_url"])
-    embed.set_footer(text=f"ID {ch['id']} · Dueño: {ch['user_id']}")
+    embed.set_footer(text=f"ID {ch['id']} Â· DueÃ±o: {ch['user_id']}")
     await interaction.response.send_message(embed=embed)
 
-@tree.command(name="editar-pj", description="Edita nombre, descripción, imagen o color")
-@app_commands.describe(pj="Personaje", nombre="Nuevo nombre", descripcion="Nueva descripción", imagen="URL imagen", color="Hex color")
+@tree.command(name="editar-pj", description="Edita nombre, descripciÃ³n, imagen o color")
+@app_commands.describe(pj="Personaje", nombre="Nuevo nombre", descripcion="Nueva descripciÃ³n", imagen="URL imagen", color="Hex color")
 @app_commands.autocomplete(pj=ac_user_chars)
 async def editar_pj(
     interaction: discord.Interaction,
@@ -1440,7 +1526,7 @@ async def editar_pj(
     try:
         char_id = int(pj)
     except ValueError:
-        await interaction.response.send_message("PJ inválido.", ephemeral=True)
+        await interaction.response.send_message("PJ invÃ¡lido.", ephemeral=True)
         return
     ch = await get_character(char_id)
     if not ch or ch["user_id"] != interaction.user.id:
@@ -1468,16 +1554,16 @@ async def editar_pj(
             (*fields.values(), char_id),
         )
         await db.commit()
-    await interaction.response.send_message("✅ Personaje actualizado.")
+    await interaction.response.send_message("âœ… Personaje actualizado.")
 
-@tree.command(name="profesion", description="Elige profesión (nivel 10+)")
-@app_commands.describe(pj="Personaje", profesion="Profesión")
+@tree.command(name="profesion", description="Elige profesiÃ³n (nivel 10+)")
+@app_commands.describe(pj="Personaje", profesion="ProfesiÃ³n")
 @app_commands.autocomplete(pj=ac_user_chars, profesion=ac_professions)
 async def profesion_cmd(interaction: discord.Interaction, pj: str, profesion: str):
     try:
         char_id = int(pj)
     except ValueError:
-        await interaction.response.send_message("PJ inválido.", ephemeral=True)
+        await interaction.response.send_message("PJ invÃ¡lido.", ephemeral=True)
         return
     ch = await get_character(char_id)
     if not ch or ch["user_id"] != interaction.user.id:
@@ -1487,16 +1573,16 @@ async def profesion_cmd(interaction: discord.Interaction, pj: str, profesion: st
         await interaction.response.send_message(f"Necesitas nivel {PROFESSION_LEVEL}.", ephemeral=True)
         return
     if ch["profession"]:
-        await interaction.response.send_message("Ya tiene profesión.", ephemeral=True)
+        await interaction.response.send_message("Ya tiene profesiÃ³n.", ephemeral=True)
         return
     profs = await list_professions(interaction.guild_id)
     if profesion not in profs:
-        await interaction.response.send_message("Profesión no existe.", ephemeral=True)
+        await interaction.response.send_message("ProfesiÃ³n no existe.", ephemeral=True)
         return
     async with aiosqlite.connect(DATABASE) as db:
         await db.execute("UPDATE characters SET profession=? WHERE id=?", (profesion, char_id))
         await db.commit()
-    await interaction.response.send_message(f"🛠️ **{ch['name']}** ahora es **{profesion}**.")
+    await interaction.response.send_message(f"ðŸ› ï¸ **{ch['name']}** ahora es **{profesion}**.")
 
 @tree.command(name="dinero", description="Ver dinero de un PJ")
 @app_commands.describe(pj="Personaje")
@@ -1506,7 +1592,7 @@ async def dinero_cmd(interaction: discord.Interaction, pj: str):
     if not ch:
         await interaction.response.send_message("PJ no encontrado.", ephemeral=True)
         return
-    await interaction.response.send_message(f"💰 **{ch['name']}** tiene **{ch['money']:,}** monedas.")
+    await interaction.response.send_message(f"ðŸ’° **{ch['name']}** tiene **{ch['money']:,}** monedas.")
 
 @tree.command(name="inv", description="Inventario de un PJ")
 @app_commands.describe(pj="Personaje")
@@ -1518,29 +1604,29 @@ async def inv_cmd(interaction: discord.Interaction, pj: str):
         return
     items = await get_inventory(ch["id"])
     if not items:
-        await interaction.response.send_message(f"🎒 Inventario de **{ch['name']}** vacío.")
+        await interaction.response.send_message(f"ðŸŽ’ Inventario de **{ch['name']}** vacÃ­o.")
         return
-    text = "\n".join(f"• **{n}** x{q} — _{t}_" for n, q, t, *_ in items)
-    embed = discord.Embed(title=f"🎒 Inventario de {ch['name']}", description=text, color=discord.Color.green())
+    text = "\n".join(f"â€¢ **{n}** x{q} â€” _{t}_" for n, q, t, *_ in items)
+    embed = discord.Embed(title=f"ðŸŽ’ Inventario de {ch['name']}", description=text, color=discord.Color.green())
     await interaction.response.send_message(embed=embed)
 
-@tree.command(name="dar-item", description="Dar ítem de tu PJ a otro PJ")
-@app_commands.describe(pj_origen="Tu personaje", pj_destino="ID del PJ destino", item="Ítem", cantidad="Cantidad")
-@app_commands.autocomplete(pj_origen=ac_user_chars, item=ac_inv_items)
+@tree.command(name="dar-item", description="Dar Ã­tem de tu PJ a otro PJ")
+@app_commands.describe(pj_origen="Tu personaje", pj_destino="Personaje destino (escribe el nombre)", item="Ãtem", cantidad="Cantidad")
+@app_commands.autocomplete(pj_origen=ac_user_chars, pj_destino=ac_all_chars, item=ac_inv_items)
 async def dar_item_cmd(
     interaction: discord.Interaction,
     pj_origen: str,
-    pj_destino: int,
+    pj_destino: str,
     item: str,
     cantidad: app_commands.Range[int, 1, 1000] = 1,
 ):
     origen = await get_character(int(pj_origen))
-    dest = await get_character(pj_destino)
+    dest = await get_character(int(pj_destino))
     if not origen or origen["user_id"] != interaction.user.id:
-        await interaction.response.send_message("PJ origen inválido.", ephemeral=True)
+        await interaction.response.send_message("PJ origen invÃ¡lido.", ephemeral=True)
         return
     if not dest or dest["guild_id"] != interaction.guild_id:
-        await interaction.response.send_message("PJ destino inválido.", ephemeral=True)
+        await interaction.response.send_message("PJ destino invÃ¡lido.", ephemeral=True)
         return
     it = await get_item(origen["id"], item)
     if not it or it[1] < cantidad:
@@ -1550,25 +1636,25 @@ async def dar_item_cmd(
     await add_item(origen["id"], item, -cantidad)
     await add_item(dest["id"], item, cantidad, it[2], data, it[4] or "", it[5] or "")
     await interaction.response.send_message(
-        f"✅ **{origen['name']}** dio **{item}** x{cantidad} a **{dest['name']}**."
+        f"âœ… **{origen['name']}** dio **{item}** x{cantidad} a **{dest['name']}**."
     )
 
 @tree.command(name="dar-dinero", description="Dar dinero de tu PJ a otro PJ")
-@app_commands.describe(pj_origen="Tu personaje", pj_destino="ID del PJ destino", cantidad="Monedas")
-@app_commands.autocomplete(pj_origen=ac_user_chars)
+@app_commands.describe(pj_origen="Tu personaje", pj_destino="Personaje destino (escribe el nombre)", cantidad="Monedas")
+@app_commands.autocomplete(pj_origen=ac_user_chars, pj_destino=ac_all_chars)
 async def dar_dinero_cmd(
     interaction: discord.Interaction,
     pj_origen: str,
-    pj_destino: int,
+    pj_destino: str,
     cantidad: app_commands.Range[int, 1, 1_000_000_000],
 ):
     origen = await get_character(int(pj_origen))
-    dest = await get_character(pj_destino)
+    dest = await get_character(int(pj_destino))
     if not origen or origen["user_id"] != interaction.user.id:
-        await interaction.response.send_message("PJ origen inválido.", ephemeral=True)
+        await interaction.response.send_message("PJ origen invÃ¡lido.", ephemeral=True)
         return
     if not dest:
-        await interaction.response.send_message("PJ destino inválido.", ephemeral=True)
+        await interaction.response.send_message("PJ destino invÃ¡lido.", ephemeral=True)
         return
     if origen["money"] < cantidad:
         await interaction.response.send_message("No tienes suficiente dinero.", ephemeral=True)
@@ -1576,11 +1662,11 @@ async def dar_dinero_cmd(
     await add_money(origen["id"], -cantidad)
     await add_money(dest["id"], cantidad)
     await interaction.response.send_message(
-        f"💰 **{origen['name']}** dio **{cantidad:,}** a **{dest['name']}**."
+        f"ðŸ’° **{origen['name']}** dio **{cantidad:,}** a **{dest['name']}**."
     )
 
-@tree.command(name="usar", description="Usar un ítem del inventario (mesa, poción, etc.)")
-@app_commands.describe(pj="Personaje", item="Ítem a usar")
+@tree.command(name="usar", description="Usar un Ã­tem del inventario (mesa, pociÃ³n, etc.)")
+@app_commands.describe(pj="Personaje", item="Ãtem a usar")
 @app_commands.autocomplete(pj=ac_user_chars, item=ac_inv_items)
 async def usar_cmd(interaction: discord.Interaction, pj: str, item: str):
     ch = await get_character(int(pj))
@@ -1589,7 +1675,7 @@ async def usar_cmd(interaction: discord.Interaction, pj: str, item: str):
         return
     it = await get_item(ch["id"], item)
     if not it:
-        await interaction.response.send_message("No tienes ese ítem.", ephemeral=True)
+        await interaction.response.send_message("No tienes ese Ã­tem.", ephemeral=True)
         return
     item_type = (it[2] or "").lower()
     # Mesa
@@ -1600,21 +1686,21 @@ async def usar_cmd(interaction: discord.Interaction, pj: str, item: str):
             return
         expected = MESA_BY_PROF.get(prof, "")
         if expected and expected.lower() not in item.lower() and item.lower() not in expected.lower():
-            # Permitir si el nombre contiene la profesión
+            # Permitir si el nombre contiene la profesiÃ³n
             if prof.lower() not in item.lower():
                 await interaction.response.send_message(
-                    f"Esta mesa no corresponde a tu profesión (**{prof}**).", ephemeral=True
+                    f"Esta mesa no corresponde a tu profesiÃ³n (**{prof}**).", ephemeral=True
                 )
                 return
         await interaction.response.send_message(
-            f"🛠️ Mesa de **{prof}** — elige una opción:",
+            f"ðŸ› ï¸ Mesa de **{prof}** â€” elige una opciÃ³n:",
             view=MesaView(ch["id"], prof),
             ephemeral=True,
         )
         return
     # Consumible simple fuera de combate
     data = json.loads(it[3] or "{}")
-    if item_type in ("poción", "pocion", "elixir", "comida"):
+    if item_type in ("pociÃ³n", "pocion", "elixir", "comida"):
         await add_item(ch["id"], item, -1)
         heal = int(data.get("CURA") or 0)
         if heal:
@@ -1626,10 +1712,10 @@ async def usar_cmd(interaction: discord.Interaction, pj: str, item: str):
                     (json.dumps(stats), ch["id"]),
                 )
                 await db.commit()
-        await interaction.response.send_message(f"✅ **{ch['name']}** usó **{item}**.")
+        await interaction.response.send_message(f"âœ… **{ch['name']}** usÃ³ **{item}**.")
         return
     await interaction.response.send_message(
-        "Este ítem se usa en combate o no tiene uso directo fuera.", ephemeral=True
+        "Este Ã­tem se usa en combate o no tiene uso directo fuera.", ephemeral=True
     )
 
 # ---- Tienda ----
@@ -1640,8 +1726,8 @@ async def tiendas_cmd(interaction: discord.Interaction):
         await interaction.response.send_message("No hay tiendas.")
         return
     embed = discord.Embed(
-        title="🛒 Tiendas",
-        description="\n".join(f"• **{n}**" for _i, n in shops),
+        title="ðŸ›’ Tiendas",
+        description="\n".join(f"â€¢ **{n}**" for _i, n in shops),
         color=discord.Color.orange(),
     )
     await interaction.response.send_message(embed=embed)
@@ -1656,21 +1742,21 @@ async def ver_tienda(interaction: discord.Interaction, tienda: str):
         return
     items = await get_shop_items(shop[0])
     if not items:
-        await interaction.response.send_message("Tienda vacía.")
+        await interaction.response.send_message("Tienda vacÃ­a.")
         return
     text = ""
     thumb = None
     for name, price, itype, desc, img, data in items:
-        text += f"• **{name}** ({itype}) — {price:,} 💰\n"
+        text += f"â€¢ **{name}** ({itype}) â€” {price:,} ðŸ’°\n"
         if img and not thumb:
             thumb = img
-    embed = discord.Embed(title=f"🛒 {tienda}", description=text, color=discord.Color.orange())
+    embed = discord.Embed(title=f"ðŸ›’ {tienda}", description=text, color=discord.Color.orange())
     if thumb:
         embed.set_thumbnail(url=thumb)
     await interaction.response.send_message(embed=embed)
 
-@tree.command(name="comprar", description="Comprar ítem para un PJ")
-@app_commands.describe(pj="Personaje que compra", tienda="Tienda", item="Ítem", cantidad="Cantidad")
+@tree.command(name="comprar", description="Comprar Ã­tem para un PJ")
+@app_commands.describe(pj="Personaje que compra", tienda="Tienda", item="Ãtem", cantidad="Cantidad")
 @app_commands.autocomplete(pj=ac_user_chars, tienda=ac_shops, item=ac_shop_items)
 async def comprar_cmd(
     interaction: discord.Interaction,
@@ -1689,7 +1775,7 @@ async def comprar_cmd(
         return
     product = await get_shop_item(shop[0], item)
     if not product:
-        await interaction.response.send_message("Ítem no está en la tienda.", ephemeral=True)
+        await interaction.response.send_message("Ãtem no estÃ¡ en la tienda.", ephemeral=True)
         return
     name, price, itype, desc, img, data_json = product
     total = price * cantidad
@@ -1700,8 +1786,8 @@ async def comprar_cmd(
     data = json.loads(data_json or "{}")
     await add_item(ch["id"], name, cantidad, itype, data, img or "", desc or "")
     embed = discord.Embed(
-        title="✅ Compra realizada",
-        description=f"**{ch['name']}** compró **{name}** x{cantidad}\nPrecio: **{total:,}**",
+        title="âœ… Compra realizada",
+        description=f"**{ch['name']}** comprÃ³ **{name}** x{cantidad}\nPrecio: **{total:,}**",
         color=discord.Color.green(),
     )
     if img:
@@ -1715,10 +1801,10 @@ async def recetas_cmd(interaction: discord.Interaction):
         await interaction.response.send_message("No hay recetas.")
         return
     lines = [
-        f"**{r[1]}** [{r[3]}] — {r[2]} → {r[4]} (ID {r[0]})"
+        f"**{r[1]}** [{r[3]}] â€” {r[2]} â†’ {r[4]} (ID {r[0]})"
         for r in recipes[:30]
     ]
-    embed = discord.Embed(title="📜 Recetas", description="\n".join(lines), color=discord.Color.teal())
+    embed = discord.Embed(title="ðŸ“œ Recetas", description="\n".join(lines), color=discord.Color.teal())
     await interaction.response.send_message(embed=embed)
 
 # ---- Combate ----
@@ -1726,12 +1812,12 @@ async def recetas_cmd(interaction: discord.Interaction):
 @app_commands.describe(
     tu_pj="Tu personaje",
     enemigo="Usuario enemigo",
-    enemigo_pj_id="ID del PJ enemigo",
+    enemigo_pj="Personaje enemigo (escribe el nombre)",
     tipo="amistoso o muerte",
     tu_rol="Tu rol",
     enemigo_rol="Rol del enemigo",
 )
-@app_commands.autocomplete(tu_pj=ac_user_chars)
+@app_commands.autocomplete(tu_pj=ac_user_chars, enemigo_pj=ac_all_chars)
 @app_commands.choices(
     tipo=[
         app_commands.Choice(name="Amistoso", value="amistoso"),
@@ -1752,21 +1838,21 @@ async def duelo_cmd(
     interaction: discord.Interaction,
     tu_pj: str,
     enemigo: discord.Member,
-    enemigo_pj_id: int,
+    enemigo_pj: str,
     tipo: str = "amistoso",
     tu_rol: str = "Atacante",
     enemigo_rol: str = "Atacante",
 ):
     a = await get_character(int(tu_pj))
-    b = await get_character(enemigo_pj_id)
+    b = await get_character(int(enemigo_pj))
     if not a or a["user_id"] != interaction.user.id:
-        await interaction.response.send_message("Tu PJ inválido.", ephemeral=True)
+        await interaction.response.send_message("Tu PJ invÃ¡lido.", ephemeral=True)
         return
     if not b or b["user_id"] != enemigo.id:
-        await interaction.response.send_message("PJ enemigo inválido.", ephemeral=True)
+        await interaction.response.send_message("PJ enemigo invÃ¡lido.", ephemeral=True)
         return
     if await get_active_combat_for_char(a["id"]) or await get_active_combat_for_char(b["id"]):
-        await interaction.response.send_message("Uno de los PJs ya está en combate.", ephemeral=True)
+        await interaction.response.send_message("Uno de los PJs ya estÃ¡ en combate.", ephemeral=True)
         return
     sa = json.loads(a["stats_json"] or "{}")
     sb = json.loads(b["stats_json"] or "{}")
@@ -1791,7 +1877,7 @@ async def duelo_cmd(
         )
         await db.commit()
     embed = discord.Embed(
-        title="⚔️ Combate iniciado",
+        title="âš”ï¸ Combate iniciado",
         description=f"**{a['name']}** vs **{b['name']}**\nTipo: **{tipo}**\nEmpieza: **{a['name']}**",
         color=discord.Color.red(),
     )
@@ -1804,16 +1890,16 @@ async def combate_cmd(interaction: discord.Interaction, pj: str):
     char_id = int(pj)
     combat_id = await get_active_combat_for_char(char_id)
     if not combat_id:
-        await interaction.response.send_message("Ese PJ no está en combate.", ephemeral=True)
+        await interaction.response.send_message("Ese PJ no estÃ¡ en combate.", ephemeral=True)
         return
     parts = await get_participants(combat_id)
     lines = []
     for p in parts:
         ch = await get_character(p["character_id"])
-        status = "✅" if p["alive"] else "💀"
-        lines.append(f"{status} **{ch['name'] if ch else p['character_id']}** — ❤️ {p['vida']} | 💧 {p['mana']} | {p['role']}")
+        status = "âœ…" if p["alive"] else "ðŸ’€"
+        lines.append(f"{status} **{ch['name'] if ch else p['character_id']}** â€” â¤ï¸ {p['vida']} | ðŸ’§ {p['mana']} | {p['role']}")
     await interaction.response.send_message(
-        embed=discord.Embed(title=f"⚔️ Combate #{combat_id}", description="\n".join(lines), color=discord.Color.orange()),
+        embed=discord.Embed(title=f"âš”ï¸ Combate #{combat_id}", description="\n".join(lines), color=discord.Color.orange()),
         view=CombatView(combat_id),
     )
 
@@ -1823,13 +1909,13 @@ async def combate_cmd(interaction: discord.Interaction, pj: str):
 async def log_cmd(interaction: discord.Interaction, pj: str):
     combat_id = await get_active_combat_for_char(int(pj))
     if not combat_id:
-        # último combate? solo activos por ahora
+        # Ãºltimo combate? solo activos por ahora
         await interaction.response.send_message("Sin combate activo.", ephemeral=True)
         return
     combat = await get_combat(combat_id)
     log = json.loads(combat.get("log_json") or "[]")
     await interaction.response.send_message(
-        "📜 **Log**\n" + ("\n".join(log[-25:]) if log else "Vacío"),
+        "ðŸ“œ **Log**\n" + ("\n".join(log[-25:]) if log else "VacÃ­o"),
         ephemeral=True,
     )
 
@@ -1840,14 +1926,46 @@ async def fin_combate(interaction: discord.Interaction, combat_id: int):
     async with aiosqlite.connect(DATABASE) as db:
         await db.execute("UPDATE combats SET status='ended' WHERE id=?", (combat_id,))
         await db.commit()
-    await interaction.response.send_message(f"🛑 Combate `{combat_id}` finalizado por admin.")
+    await interaction.response.send_message(f"ðŸ›‘ Combate `{combat_id}` finalizado por admin.")
 
 # ---- Admin content ----
-@tree.command(name="crear-clase", description="Admin: crear clase")
+@tree.command(name="crear-clase", description="Admin: crear clase con stats base")
 @admin_only()
-@app_commands.describe(nombre="Nombre", descripcion="Descripción con códigos $FUE=5 $VIDA_MAX=20 etc.")
-async def crear_clase(interaction: discord.Interaction, nombre: str, descripcion: str = ""):
-    stats = parse_codes(descripcion)
+@app_commands.describe(
+    nombre="Nombre de la clase",
+    descripcion="DescripciÃ³n / lore (opcional)",
+    vida="Vida mÃ¡xima base",
+    fuerza="Fuerza base",
+    velocidad="Velocidad base",
+    resistencia="Resistencia base",
+    defensa="Defensa base",
+    mana="ManÃ¡ mÃ¡ximo base",
+)
+async def crear_clase(
+    interaction: discord.Interaction,
+    nombre: str,
+    descripcion: str = "",
+    vida: app_commands.Range[int, 1, 10000] = 20,
+    fuerza: app_commands.Range[int, 0, 1000] = 5,
+    velocidad: app_commands.Range[int, 0, 1000] = 5,
+    resistencia: app_commands.Range[int, 0, 1000] = 5,
+    defensa: app_commands.Range[int, 0, 1000] = 3,
+    mana: app_commands.Range[int, 0, 10000] = 10,
+):
+    stats = {
+        "VIDA": vida,
+        "VIDA_MAX": vida,
+        "FUE": fuerza,
+        "VEL": velocidad,
+        "RES": resistencia,
+        "DEF": defensa,
+        "MANA": mana,
+        "MANA_MAX": mana,
+    }
+    # Por si tambiÃ©n ponen cÃ³digos en la descripciÃ³n
+    stats.update(parse_codes(descripcion))
+    stats["VIDA"] = stats.get("VIDA_MAX", stats.get("VIDA", vida))
+    stats["MANA"] = stats.get("MANA_MAX", stats.get("MANA", mana))
     async with aiosqlite.connect(DATABASE) as db:
         await db.execute(
             """INSERT INTO classes (guild_id, name, description, stats_json) VALUES (?,?,?,?)
@@ -1855,18 +1973,25 @@ async def crear_clase(interaction: discord.Interaction, nombre: str, descripcion
             (interaction.guild_id, nombre.strip(), descripcion, json.dumps(stats)),
         )
         await db.commit()
-    await interaction.response.send_message(f"✅ Clase **{nombre}** guardada.\nStats: `{stats}`")
+    embed = discord.Embed(title=f"âœ… Clase: {nombre}", description=descripcion or "Sin descripciÃ³n", color=discord.Color.purple())
+    embed.add_field(
+        name="Stats base",
+        value="\n".join(f"**{k}:** {v}" for k, v in stats.items()),
+        inline=False,
+    )
+    embed.set_footer(text="Al crear un PJ con esta clase, recibirÃ¡ estas stats")
+    await interaction.response.send_message(embed=embed)
 
 @tree.command(name="clases", description="Lista de clases")
 async def clases_cmd(interaction: discord.Interaction):
     classes = await list_classes(interaction.guild_id)
     await interaction.response.send_message(
-        "⚔️ **Clases:** " + (", ".join(classes) if classes else "Ninguna")
+        "âš”ï¸ **Clases:** " + (", ".join(classes) if classes else "Ninguna")
     )
 
-@tree.command(name="crear-profesion", description="Admin: crear profesión")
+@tree.command(name="crear-profesion", description="Admin: crear profesiÃ³n")
 @admin_only()
-@app_commands.describe(nombre="Nombre", descripcion="Descripción")
+@app_commands.describe(nombre="Nombre", descripcion="DescripciÃ³n")
 async def crear_profesion(interaction: discord.Interaction, nombre: str, descripcion: str = ""):
     async with aiosqlite.connect(DATABASE) as db:
         await db.execute(
@@ -1875,13 +2000,13 @@ async def crear_profesion(interaction: discord.Interaction, nombre: str, descrip
             (interaction.guild_id, nombre.strip(), descripcion),
         )
         await db.commit()
-    await interaction.response.send_message(f"✅ Profesión **{nombre}** creada.")
+    await interaction.response.send_message(f"âœ… ProfesiÃ³n **{nombre}** creada.")
 
 @tree.command(name="profesiones", description="Lista profesiones")
 async def profesiones_cmd(interaction: discord.Interaction):
     profs = await list_professions(interaction.guild_id)
     await interaction.response.send_message(
-        "🛠️ **Profesiones:** " + (", ".join(profs) if profs else "Ninguna")
+        "ðŸ› ï¸ **Profesiones:** " + (", ".join(profs) if profs else "Ninguna")
     )
 
 @tree.command(name="crear-tienda", description="Admin: crear tienda")
@@ -1893,7 +2018,7 @@ async def crear_tienda(interaction: discord.Interaction, nombre: str):
     async with aiosqlite.connect(DATABASE) as db:
         await db.execute("INSERT INTO shops (guild_id, name) VALUES (?,?)", (interaction.guild_id, nombre.strip()))
         await db.commit()
-    await interaction.response.send_message(f"✅ Tienda **{nombre}** creada.")
+    await interaction.response.send_message(f"âœ… Tienda **{nombre}** creada.")
 
 @tree.command(name="borrar-tienda", description="Admin: borrar tienda")
 @admin_only()
@@ -1908,13 +2033,13 @@ async def borrar_tienda(interaction: discord.Interaction, tienda: str):
         await db.execute("DELETE FROM shop_items WHERE shop_id=?", (shop[0],))
         await db.execute("DELETE FROM shops WHERE id=?", (shop[0],))
         await db.commit()
-    await interaction.response.send_message(f"🗑️ Tienda **{tienda}** eliminada.")
+    await interaction.response.send_message(f"ðŸ—‘ï¸ Tienda **{tienda}** eliminada.")
 
-@tree.command(name="item-tienda", description="Admin: añadir ítem a tienda")
+@tree.command(name="item-tienda", description="Admin: aÃ±adir Ã­tem a tienda")
 @admin_only()
 @app_commands.describe(
     tienda="Tienda", item="Nombre", precio="Precio", tipo="Tipo",
-    descripcion="Descripción con códigos $DAÑO=5 $DUR=10 etc.",
+    descripcion="DescripciÃ³n con cÃ³digos $DAÃ‘O=5 $DUR=10 etc.",
     imagen="URL imagen",
 )
 @app_commands.autocomplete(tienda=ac_shops)
@@ -1941,7 +2066,7 @@ async def item_tienda_cmd(
             (shop[0], item, precio, tipo, descripcion, imagen, json.dumps(data)),
         )
         await db.commit()
-    embed = discord.Embed(title="✅ Ítem añadido", description=f"**{item}** en **{tienda}**", color=discord.Color.orange())
+    embed = discord.Embed(title="âœ… Ãtem aÃ±adido", description=f"**{item}** en **{tienda}**", color=discord.Color.orange())
     embed.add_field(name="Precio", value=f"{precio:,}", inline=True)
     embed.add_field(name="Tipo", value=tipo, inline=True)
     if data:
@@ -1950,9 +2075,9 @@ async def item_tienda_cmd(
         embed.set_thumbnail(url=imagen)
     await interaction.response.send_message(embed=embed)
 
-@tree.command(name="quitar-item", description="Admin: quitar ítem de tienda")
+@tree.command(name="quitar-item", description="Admin: quitar Ã­tem de tienda")
 @admin_only()
-@app_commands.describe(tienda="Tienda", item="Ítem")
+@app_commands.describe(tienda="Tienda", item="Ãtem")
 @app_commands.autocomplete(tienda=ac_shops, item=ac_shop_items)
 async def quitar_item_cmd(interaction: discord.Interaction, tienda: str, item: str):
     shop = await get_shop_by_name(interaction.guild_id, tienda)
@@ -1962,11 +2087,11 @@ async def quitar_item_cmd(interaction: discord.Interaction, tienda: str, item: s
     async with aiosqlite.connect(DATABASE) as db:
         await db.execute("DELETE FROM shop_items WHERE shop_id=? AND item_name=?", (shop[0], item))
         await db.commit()
-    await interaction.response.send_message(f"🗑️ **{item}** eliminado de **{tienda}**.")
+    await interaction.response.send_message(f"ðŸ—‘ï¸ **{item}** eliminado de **{tienda}**.")
 
 @tree.command(name="crear-material", description="Admin: crear material de crafteo")
 @admin_only()
-@app_commands.describe(nombre="Nombre", descripcion="Descripción", imagen="URL")
+@app_commands.describe(nombre="Nombre", descripcion="DescripciÃ³n", imagen="URL")
 async def crear_material(interaction: discord.Interaction, nombre: str, descripcion: str = "", imagen: str = ""):
     async with aiosqlite.connect(DATABASE) as db:
         await db.execute(
@@ -1975,19 +2100,19 @@ async def crear_material(interaction: discord.Interaction, nombre: str, descripc
             (interaction.guild_id, nombre.strip(), descripcion, imagen),
         )
         await db.commit()
-    await interaction.response.send_message(f"✅ Material **{nombre}** creado. Añádelo a tiendas o inv con admin `/craftear`.")
+    await interaction.response.send_message(f"âœ… Material **{nombre}** creado. AÃ±Ã¡delo a tiendas o inv con admin `/craftear`.")
 
 @tree.command(name="crear-receta", description="Admin: crear receta de crafteo")
 @admin_only()
 @app_commands.describe(
     nombre="Nombre de la receta",
-    profesion="Profesión requerida",
+    profesion="ProfesiÃ³n requerida",
     grado="Comun/Refinado/Superior/Magistral",
-    resultado="Nombre del ítem resultante",
-    tipo_resultado="Arma/Armadura/Artefacto/Poción...",
+    resultado="Nombre del Ã­tem resultante",
+    tipo_resultado="Arma/Armadura/Artefacto/PociÃ³n...",
     materiales="Ej: Hierro:2,Madera:1",
-    stats_resultado="Códigos $DAÑO=5 $DUR=10",
-    con_magia="¿Requiere material mágico?",
+    stats_resultado="CÃ³digos $DAÃ‘O=5 $DUR=10",
+    con_magia="Â¿Requiere material mÃ¡gico?",
     material_magico="Nombre del material de afinidad",
     imagen="URL",
 )
@@ -2035,12 +2160,12 @@ async def crear_receta(
         )
         await db.commit()
     await interaction.response.send_message(
-        f"✅ Receta **{nombre}** creada.\nMateriales: `{mats}`\nStats: `{data}`"
+        f"âœ… Receta **{nombre}** creada.\nMateriales: `{mats}`\nStats: `{data}`"
     )
 
-@tree.command(name="craftear", description="Admin: crear ítem directo en inventario de un PJ")
+@tree.command(name="craftear", description="Admin: crear Ã­tem directo en inventario de un PJ")
 @admin_only()
-@app_commands.describe(pj_id="ID del personaje", item="Nombre", tipo="Tipo", cantidad="Cantidad", stats="Códigos $DAÑO=5", imagen="URL")
+@app_commands.describe(pj_id="ID del personaje", item="Nombre", tipo="Tipo", cantidad="Cantidad", stats="CÃ³digos $DAÃ‘O=5", imagen="URL")
 async def admin_craftear(
     interaction: discord.Interaction,
     pj_id: int,
@@ -2058,7 +2183,7 @@ async def admin_craftear(
     if "DUR" in data:
         data["DUR_MAX"] = data["DUR"]
     await add_item(pj_id, item, cantidad, tipo, data, imagen, stats)
-    await interaction.response.send_message(f"✅ Admin dio **{item}** x{cantidad} a **{ch['name']}**.")
+    await interaction.response.send_message(f"âœ… Admin dio **{item}** x{cantidad} a **{ch['name']}**.")
 
 @tree.command(name="reparar", description="Admin: reparar arma de un PJ (restaura DUR)")
 @admin_only()
@@ -2066,7 +2191,7 @@ async def admin_craftear(
 async def admin_reparar(interaction: discord.Interaction, pj_id: int, arma: str):
     it = await get_item(pj_id, arma)
     if not it:
-        await interaction.response.send_message("Ítem no encontrado.", ephemeral=True)
+        await interaction.response.send_message("Ãtem no encontrado.", ephemeral=True)
         return
     data = json.loads(it[3] or "{}")
     if "DUR_MAX" in data:
@@ -2077,7 +2202,7 @@ async def admin_reparar(interaction: discord.Interaction, pj_id: int, arma: str)
             (json.dumps(data), pj_id, arma),
         )
         await db.commit()
-    await interaction.response.send_message(f"🔧 **{arma}** reparada (admin).")
+    await interaction.response.send_message(f"ðŸ”§ **{arma}** reparada (admin).")
 
 @tree.command(name="dar-xp", description="Admin: dar XP a un PJ")
 @admin_only()
@@ -2089,7 +2214,7 @@ async def dar_xp_cmd(interaction: discord.Interaction, pj_id: int, cantidad: app
         return
     await grant_xp(pj_id, cantidad, interaction.channel)
     ch2 = await get_character(pj_id)
-    await interaction.response.send_message(f"✅ +{cantidad} XP a **{ch['name']}** → Nv.{ch2['level']} ({ch2['xp']} XP)")
+    await interaction.response.send_message(f"âœ… +{cantidad} XP a **{ch['name']}** â†’ Nv.{ch2['level']} ({ch2['xp']} XP)")
 
 @tree.command(name="quitar-xp", description="Admin: quitar XP a un PJ")
 @admin_only()
@@ -2104,7 +2229,7 @@ async def quitar_xp_cmd(interaction: discord.Interaction, pj_id: int, cantidad: 
     async with aiosqlite.connect(DATABASE) as db:
         await db.execute("UPDATE characters SET xp=?, level=? WHERE id=?", (new_xp, new_level, pj_id))
         await db.commit()
-    await interaction.response.send_message(f"✅ XP actualizado: **{new_xp}** (Nv.{new_level})")
+    await interaction.response.send_message(f"âœ… XP actualizado: **{new_xp}** (Nv.{new_level})")
 
 @tree.command(name="ver-xp", description="Ver XP de un PJ")
 @app_commands.describe(pj="Personaje")
@@ -2115,7 +2240,7 @@ async def ver_xp_cmd(interaction: discord.Interaction, pj: str):
         await interaction.response.send_message("No encontrado.", ephemeral=True)
         return
     await interaction.response.send_message(
-        f"📊 **{ch['name']}** — Nivel **{ch['level']}** | XP **{ch['xp']}** | Rango **{rank_from_level(ch['level'])}**"
+        f"ðŸ“Š **{ch['name']}** â€” Nivel **{ch['level']}** | XP **{ch['xp']}** | Rango **{rank_from_level(ch['level'])}**"
     )
 
 @tree.command(name="admin-dar-dinero", description="Admin: dar dinero a un PJ")
@@ -2127,7 +2252,7 @@ async def admin_dar_dinero(interaction: discord.Interaction, pj_id: int, cantida
         await interaction.response.send_message("PJ no existe.", ephemeral=True)
         return
     new = await add_money(pj_id, cantidad)
-    await interaction.response.send_message(f"💰 **{ch['name']}** ahora tiene **{new:,}**.")
+    await interaction.response.send_message(f"ðŸ’° **{ch['name']}** ahora tiene **{new:,}**.")
 
 @tree.command(name="quitar-dinero", description="Admin: quitar dinero a un PJ")
 @admin_only()
@@ -2138,18 +2263,18 @@ async def admin_quitar_dinero(interaction: discord.Interaction, pj_id: int, cant
         await interaction.response.send_message("PJ no existe.", ephemeral=True)
         return
     new = await add_money(pj_id, -cantidad)
-    await interaction.response.send_message(f"💰 **{ch['name']}** ahora tiene **{new:,}**.")
+    await interaction.response.send_message(f"ðŸ’° **{ch['name']}** ahora tiene **{new:,}**.")
 
-@tree.command(name="config-nivel", description="Admin: nivel máximo del server")
+@tree.command(name="config-nivel", description="Admin: nivel mÃ¡ximo del server")
 @admin_only()
-@app_commands.describe(maximo="Nivel máximo (ej. 50)")
+@app_commands.describe(maximo="Nivel mÃ¡ximo (ej. 50)")
 async def config_nivel(interaction: discord.Interaction, maximo: app_commands.Range[int, 1, 500]):
     await set_guild_field(interaction.guild_id, "max_level", maximo)
-    await interaction.response.send_message(f"✅ Nivel máximo: **{maximo}**")
+    await interaction.response.send_message(f"âœ… Nivel mÃ¡ximo: **{maximo}**")
 
 @tree.command(name="reward-nivel", description="Admin: recompensas/stats al subir de nivel")
 @admin_only()
-@app_commands.describe(nivel="Nivel", recompensas="Texto separado por |", stats="Códigos $FUE=1 $VIDA_MAX=2")
+@app_commands.describe(nivel="Nivel", recompensas="Texto separado por |", stats="CÃ³digos $FUE=1 $VIDA_MAX=2")
 async def reward_nivel(interaction: discord.Interaction, nivel: app_commands.Range[int, 1, 500], recompensas: str = "", stats: str = ""):
     rw = [x.strip() for x in recompensas.split("|") if x.strip()]
     st = parse_codes(stats)
@@ -2160,17 +2285,77 @@ async def reward_nivel(interaction: discord.Interaction, nivel: app_commands.Ran
             (interaction.guild_id, nivel, json.dumps(rw), json.dumps(st)),
         )
         await db.commit()
-    await interaction.response.send_message(f"✅ Nivel {nivel}: rewards={rw} stats={st}")
+    await interaction.response.send_message(f"âœ… Nivel {nivel}: rewards={rw} stats={st}")
 
-@tree.command(name="canal-xp", description="Admin: canal donde se gana XP escribiendo")
+@tree.command(name="canal-xp", description="Admin: aÃ±adir/quitar canal XP (repetir el mismo lo quita)")
 @admin_only()
-@app_commands.describe(canal="Canal de XP (omitir para desactivar)")
-async def canal_xp(interaction: discord.Interaction, canal: discord.TextChannel = None):
-    await set_guild_field(interaction.guild_id, "xp_channel_id", canal.id if canal else None)
-    if canal:
-        await interaction.response.send_message(f"✅ XP de mensajes en {canal.mention}")
+@app_commands.describe(canal="Canal de roleplay para XP")
+async def canal_xp(interaction: discord.Interaction, canal: discord.TextChannel):
+    cfg = await get_guild_config(interaction.guild_id)
+    channels = list(cfg.get("xp_channels") or [])
+    if canal.id in channels:
+        channels.remove(canal.id)
+        await set_guild_field(interaction.guild_id, "xp_channels", json.dumps(channels))
+        await set_guild_field(interaction.guild_id, "xp_channel_id", channels[0] if channels else None)
+        await interaction.response.send_message(
+            f"ðŸ—‘ï¸ {canal.mention} quitado de XP.\nActivos: {', '.join(f'<#{c}>' for c in channels) or 'ninguno'}"
+        )
     else:
-        await interaction.response.send_message("✅ XP por mensajes desactivado.")
+        channels.append(canal.id)
+        await set_guild_field(interaction.guild_id, "xp_channels", json.dumps(channels))
+        await set_guild_field(interaction.guild_id, "xp_channel_id", canal.id)
+        await interaction.response.send_message(
+            f"âœ… {canal.mention} aÃ±adido a XP.\nActivos: {', '.join(f'<#{c}>' for c in channels)}\n_(Repetir el mismo canal lo quita.)_"
+        )
+
+@tree.command(name="categoria-xp", description="Admin: aÃ±adir/quitar categorÃ­a XP (repetir la misma la quita)")
+@admin_only()
+@app_commands.describe(categoria="CategorÃ­a donde se gana XP con tuppers")
+async def categoria_xp(interaction: discord.Interaction, categoria: discord.CategoryChannel):
+    cfg = await get_guild_config(interaction.guild_id)
+    cats = list(cfg.get("xp_categories") or [])
+    if categoria.id in cats:
+        cats.remove(categoria.id)
+        await set_guild_field(interaction.guild_id, "xp_categories", json.dumps(cats))
+        await interaction.response.send_message(f"ðŸ—‘ï¸ CategorÃ­a **{categoria.name}** quitada de XP.")
+    else:
+        cats.append(categoria.id)
+        await set_guild_field(interaction.guild_id, "xp_categories", json.dumps(cats))
+        await interaction.response.send_message(
+            f"âœ… CategorÃ­a **{categoria.name}** aÃ±adida a XP.\n_(Repetir la misma la quita.)_"
+        )
+
+@tree.command(name="vincular-tupper", description="Vincula un tupper de Tupperbox a tu PJ")
+@app_commands.describe(pj="Tu personaje", nombre_tupper="Nombre exacto del tupper")
+@app_commands.autocomplete(pj=ac_user_chars)
+async def vincular_tupper(interaction: discord.Interaction, pj: str, nombre_tupper: str):
+    ch = await get_character(int(pj))
+    if not ch or ch["user_id"] != interaction.user.id:
+        await interaction.response.send_message("No es tu PJ.", ephemeral=True)
+        return
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute(
+            "UPDATE characters SET tupper_name=? WHERE id=?",
+            (nombre_tupper.strip(), ch["id"]),
+        )
+        await db.commit()
+    await interaction.response.send_message(
+        f"ðŸ”— **{ch['name']}** â†” tupper **{nombre_tupper.strip()}**\n"
+        f"XP solo cuando escribas con ese tupper en canal/categorÃ­a XP."
+    )
+
+@tree.command(name="desvincular-tupper", description="Quita el tupper vinculado de un PJ")
+@app_commands.describe(pj="Tu personaje")
+@app_commands.autocomplete(pj=ac_user_chars)
+async def desvincular_tupper(interaction: discord.Interaction, pj: str):
+    ch = await get_character(int(pj))
+    if not ch or ch["user_id"] != interaction.user.id:
+        await interaction.response.send_message("No es tu PJ.", ephemeral=True)
+        return
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute("UPDATE characters SET tupper_name='' WHERE id=?", (ch["id"],))
+        await db.commit()
+    await interaction.response.send_message(f"âœ… Tupper desvinculado de **{ch['name']}**.")
 
 @tree.command(name="roles-admin", description="Admin: roles que pueden usar comandos admin")
 @admin_only()
@@ -2180,27 +2365,29 @@ async def roles_admin(interaction: discord.Interaction, rol1: discord.Role, rol2
         if r and r.id not in roles:
             roles.append(r.id)
     await set_guild_field(interaction.guild_id, "admin_roles", json.dumps(roles))
-    await interaction.response.send_message("✅ Roles admin actualizados.")
+    await interaction.response.send_message("âœ… Roles admin actualizados.")
 
-@tree.command(name="config", description="Admin: ver configuración")
+@tree.command(name="config", description="Admin: ver configuraciÃ³n")
 @admin_only()
 async def config_cmd(interaction: discord.Interaction):
     cfg = await get_guild_config(interaction.guild_id)
     classes = await list_classes(interaction.guild_id)
     profs = await list_professions(interaction.guild_id)
-    embed = discord.Embed(title="⚙️ Configuración", color=discord.Color.blue())
-    embed.add_field(name="Nivel máx.", value=str(cfg["max_level"]), inline=True)
-    embed.add_field(name="Canal XP", value=str(cfg["xp_channel_id"] or "—"), inline=True)
-    embed.add_field(name="Clases", value=", ".join(classes) or "—", inline=False)
-    embed.add_field(name="Profesiones", value=", ".join(profs) or "—", inline=False)
+    embed = discord.Embed(title="âš™ï¸ ConfiguraciÃ³n", color=discord.Color.blue())
+    embed.add_field(name="Nivel mÃ¡x.", value=str(cfg["max_level"]), inline=True)
+    chs = cfg.get("xp_channels") or []
+    cats = cfg.get("xp_categories") or []
+    embed.add_field(name="Canales XP", value=", ".join(f"<#{c}>" for c in chs) or "â€”", inline=False)
+    embed.add_field(name="CategorÃ­as XP", value=", ".join(f"`{c}`" for c in cats) or "â€”", inline=False)
+    embed.add_field(name="Clases", value=", ".join(classes) or "â€”", inline=False)
+    embed.add_field(name="Profesiones", value=", ".join(profs) or "â€”", inline=False)
     await interaction.response.send_message(embed=embed)
 
-@tree.command(name="embed", description="Admin: crear un embed")
+@tree.command(name="embed", description="Admin: crear un embed en este mismo canal")
 @admin_only()
-@app_commands.describe(canal="Canal", titulo="Título", descripcion="Descripción", color="Hex", imagen="URL", thumbnail="URL mini")
+@app_commands.describe(titulo="TÃ­tulo", descripcion="DescripciÃ³n", color="Hex", imagen="URL", thumbnail="URL mini")
 async def embed_cmd(
     interaction: discord.Interaction,
-    canal: discord.TextChannel,
     titulo: str = None,
     descripcion: str = None,
     color: str = "5865F2",
@@ -2220,12 +2407,12 @@ async def embed_cmd(
         emb.set_image(url=imagen)
     if thumbnail:
         emb.set_thumbnail(url=thumbnail)
-    await canal.send(embed=emb)
-    await interaction.response.send_message(f"✅ Embed enviado en {canal.mention}", ephemeral=True)
+    await interaction.channel.send(embed=emb)
+    await interaction.response.send_message("âœ… Embed enviado aquÃ­.", ephemeral=True)
 
 # ==================== MAIN ====================
 if __name__ == "__main__":
     if not TOKEN:
-        print("❌ Falta DISCORD_TOKEN en variables de entorno")
+        print("âŒ Falta DISCORD_TOKEN en variables de entorno")
     else:
         bot.run(TOKEN)
